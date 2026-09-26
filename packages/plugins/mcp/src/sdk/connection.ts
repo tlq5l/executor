@@ -30,6 +30,10 @@ import { detectInsufficientScope } from "@executor-js/sdk/core";
 export type McpConnection = {
   readonly client: Client;
   readonly close: () => Promise<void>;
+  /** True once a transport known to be process-backed has closed. */
+  readonly isClosed?: () => boolean;
+  /** Number of tools/call messages handed to the transport, when observable. */
+  readonly toolCallSendCount?: () => number;
 };
 
 export type McpConnector = Effect.Effect<
@@ -424,9 +428,13 @@ const createClient = (sdk: McpClientSdk, versionNegotiation?: { readonly mode: "
     },
   );
 
-const connectionFromClient = (client: Client): McpConnection => ({
+const connectionFromClient = (
+  client: Client,
+  health?: Pick<McpConnection, "isClosed" | "toolCallSendCount">,
+): McpConnection => ({
   client,
   close: () => client.close(),
+  ...health,
 });
 
 const connectionFailure = (
@@ -502,6 +510,7 @@ const autoTransportFailure = (
 const connectClient = (input: {
   transport: string;
   createTransport: (sdk: McpClientSdk) => Parameters<Client["connect"]>[0];
+  health?: Pick<McpConnection, "isClosed" | "toolCallSendCount">;
   versionNegotiation?: { readonly mode: "auto" };
 }): Effect.Effect<McpConnection, McpConnectionError | McpOAuthReauthorizationRequired> =>
   Effect.gen(function* () {
@@ -540,7 +549,7 @@ const connectClient = (input: {
       }),
     );
 
-    return connectionFromClient(client);
+    return connectionFromClient(client, input.health);
   });
 
 // ---------------------------------------------------------------------------
@@ -597,7 +606,7 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
     return Effect.gen(function* () {
       // Dynamic import so the underlying module (which evaluates
       // `node:child_process`) is only loaded when stdio is actually used.
-      const { createStdioTransport } = yield* Effect.tryPromise({
+      const { createStdioTransport, isStdioTransportClosed } = yield* Effect.tryPromise({
         try: () => import("./stdio-connector"),
         catch: () =>
           new McpConnectionError({
@@ -606,21 +615,41 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
           }),
       });
 
+      let stdioTransport: Awaited<ReturnType<typeof createStdioTransport>> | undefined;
+      let toolCallSendCount = 0;
       return yield* connectClient({
         transport: "stdio",
+        health: {
+          isClosed: () => isStdioTransportClosed(stdioTransport),
+          toolCallSendCount: () => toolCallSendCount,
+        },
         // Opt-in per integration (default legacy) — see
         // `McpStdioVersionNegotiation` for why stdio does not follow the
         // remote transport's unconditional auto.
         ...(input.versionNegotiation === "auto"
           ? { versionNegotiation: { mode: "auto" as const } }
           : {}),
-        createTransport: () =>
-          createStdioTransport({
+        createTransport: () => {
+          stdioTransport = createStdioTransport({
             command,
             args: input.args,
             env: input.env,
             cwd: input.cwd?.trim().length ? input.cwd.trim() : undefined,
-          }),
+          });
+          const send = stdioTransport.send.bind(stdioTransport);
+          stdioTransport.send = (message) => {
+            if (
+              typeof message === "object" &&
+              message !== null &&
+              "method" in message &&
+              message.method === "tools/call"
+            ) {
+              toolCallSendCount += 1;
+            }
+            return send(message);
+          };
+          return stdioTransport;
+        },
       });
     });
   }

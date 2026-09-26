@@ -1,9 +1,14 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect } from "effect";
+import { Duration, Effect } from "effect";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ElicitationResponse, type Elicit } from "@executor-js/sdk";
 
-import { createMcpConnector } from "./connection";
+import { createMcpConnector, type McpConnection } from "./connection";
 import { createMcpConnectionPool } from "./connection-pool";
+import { McpInvocationError } from "./errors";
 import { invokeMcpTool } from "./invoke";
 import { makeEchoMcpServer, serveMcpServer } from "../testing";
 
@@ -32,6 +37,30 @@ const invoke = (input: {
     elicit: input.elicit ?? acceptAll,
   });
 
+const stdioReconnectFixture = fileURLToPath(
+  new URL("./stdio-reconnect-test-server.ts", import.meta.url),
+);
+
+const waitUntil = (predicate: () => boolean, timeoutMs: number) =>
+  Effect.gen(function* () {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) return false;
+      yield* Effect.sleep(Duration.millis(25));
+    }
+    return true;
+  });
+
+const isAlive = (pid: number): boolean => {
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: process.kill(pid, 0) reports an exited child via ESRCH
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 describe("MCP connection pool", () => {
   it.effect("reuses one session for sequential invokes", () =>
     Effect.scoped(
@@ -56,6 +85,45 @@ describe("MCP connection pool", () => {
         expect(second).toMatchObject({ content: [{ type: "text", text: "second" }] });
         expect(server.sessionCount()).toBe(1);
         yield* pool.close();
+      }),
+    ),
+  );
+
+  it.live("reconnects when a cached stdio server process exits", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const pidFile = join(mkdtempSync(join(tmpdir(), "mcp-stdio-reconnect-")), "pids");
+        const connector = createMcpConnector({
+          transport: "stdio",
+          command: "bun",
+          args: ["run", stdioReconnectFixture, pidFile],
+        });
+        const pool = createMcpConnectionPool();
+        yield* Effect.addFinalizer(() => pool.close());
+        const invokeEcho = (value: string) =>
+          invokeMcpTool({
+            toolId: "echo",
+            toolName: "echo",
+            args: { value },
+            transport: "stdio",
+            connector,
+            connectionPool: pool,
+            connectionPoolKey: pidFile,
+            elicit: acceptAll,
+          });
+
+        const first = yield* invokeEcho("before");
+        expect(first).toMatchObject({ content: [{ type: "text", text: "before" }] });
+        expect(yield* waitUntil(() => existsSync(pidFile), 10_000)).toBe(true);
+        const firstPid = Number(readFileSync(pidFile, "utf8").trim().split("\n")[0]);
+
+        process.kill(firstPid, "SIGKILL");
+        expect(yield* waitUntil(() => !isAlive(firstPid), 5_000)).toBe(true);
+
+        const second = yield* invokeEcho("after");
+
+        expect(second).toMatchObject({ content: [{ type: "text", text: "after" }] });
+        expect(readFileSync(pidFile, "utf8").trim().split("\n")).toHaveLength(2);
       }),
     ),
   );
@@ -152,6 +220,72 @@ describe("MCP connection pool", () => {
         yield* pool.close();
       }),
     ),
+  );
+
+  it.effect("retries once only when the failed tool call was never sent", () =>
+    Effect.gen(function* () {
+      const pool = createMcpConnectionPool();
+      let dials = 0;
+      let calls = 0;
+      const connector = Effect.sync(() => {
+        dials += 1;
+        return {
+          // oxlint-disable-next-line executor/no-double-cast -- boundary: this pool test never calls methods on the client
+          client: {} as unknown as McpConnection["client"],
+          close: async () => undefined,
+        };
+      });
+
+      const result = yield* pool.withConnection("retry-safe", connector, () => {
+        calls += 1;
+        return calls === 1
+          ? Effect.fail(
+              new McpInvocationError({
+                toolName: "echo",
+                message: "not sent",
+                transportFailure: true,
+                requestNotSent: true,
+              }),
+            )
+          : Effect.succeed("retried");
+      });
+
+      expect(result).toBe("retried");
+      expect(calls).toBe(2);
+      expect(dials).toBe(2);
+      yield* pool.close();
+    }),
+  );
+
+  it.effect("does not retry a transport failure that may have reached the server", () =>
+    Effect.gen(function* () {
+      const pool = createMcpConnectionPool();
+      let dials = 0;
+      const connector = Effect.sync(() => {
+        dials += 1;
+        return {
+          // oxlint-disable-next-line executor/no-double-cast -- boundary: this pool test never calls methods on the client
+          client: {} as unknown as McpConnection["client"],
+          close: async () => undefined,
+        };
+      });
+
+      const failure = yield* pool
+        .withConnection("retry-unsafe", connector, () =>
+          Effect.fail(
+            new McpInvocationError({
+              toolName: "echo",
+              message: "possibly sent",
+              transportFailure: true,
+            }),
+          ),
+        )
+        .pipe(Effect.flip);
+
+      expect(failure.message).toBe("possibly sent");
+      expect(dials).toBe(1);
+      yield* pool.close();
+    }),
   );
 
   it.effect("drops a pooled session whose bearer the server has stopped accepting", () =>

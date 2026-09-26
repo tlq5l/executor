@@ -369,6 +369,7 @@ const useConnection = (
     );
     installElicitationHandler(connection.client, elicit, deadline);
     installToolListChangedHandler(connection.client, onToolListChanged);
+    const toolCallSendCountBefore = connection.toolCallSendCount?.();
     return yield* Effect.tryPromise({
       try: () =>
         connection.client.callTool(
@@ -409,7 +410,14 @@ const useConnection = (
           sdkFailure,
           ...(status === undefined ? {} : { status }),
           ...(protocolError === undefined
-            ? { transportFailure: true }
+            ? {
+                transportFailure: true,
+                ...(connection.isClosed?.() === true &&
+                toolCallSendCountBefore !== undefined &&
+                connection.toolCallSendCount?.() === toolCallSendCountBefore
+                  ? { requestNotSent: true }
+                  : {}),
+              }
             : {
                 // A JSON-RPC error is the server's answer to this call, written
                 // for the caller (the same trust level as an `isError` result

@@ -151,3 +151,21 @@ export const createStdioTransport = (config: StdioTransportConfig) =>
     }),
     cwd: config.cwd,
   });
+
+/** The SDK clears `pid` on the child's `close` event. Check the process too so
+ *  a caller between `exit` and `close` cannot write to a known-dead child. */
+export const isStdioTransportClosed = (
+  transport: ReturnType<typeof createStdioTransport> | undefined,
+): boolean => {
+  const pid = transport?.pid;
+  if (pid === null || pid === undefined) return true;
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: process.kill(pid, 0) reports a dead stdio child through ESRCH
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (cause) {
+    const isPermissionDenied =
+      typeof cause === "object" && cause !== null && "code" in cause && cause.code === "EPERM";
+    return !isPermissionDenied;
+  }
+};

@@ -74,7 +74,8 @@ export interface McpConnectionPool {
 }
 
 /** Creates an MCP connection pool with lazy five-minute idle eviction and one
- * automatic fresh-dial retry for a reused session rejected with HTTP 404.
+ * automatic fresh-dial retry for a reused session rejected with HTTP 404 or a
+ * call proven not to have reached a closed process-backed transport.
  *
  * "Lazy" means activity-driven — there is no timer and no background fiber — but
  * it applies to EVERY parked connection, not only the identity being asked for.
@@ -124,7 +125,10 @@ export const createMcpConnectionPool = (): McpConnectionPool => {
         const entry = idle.get(key);
         if (!entry) return { connection: undefined, expired: undefined };
         idle.delete(key);
-        if (Date.now() - entry.idleSince >= IDLE_TTL_MS) {
+        if (
+          Date.now() - entry.idleSince >= IDLE_TTL_MS ||
+          entry.connection.isClosed?.() === true
+        ) {
           return { connection: undefined, expired: entry.connection };
         }
         return { connection: entry.connection, expired: undefined };
@@ -168,7 +172,8 @@ export const createMcpConnectionPool = (): McpConnectionPool => {
 
     return run(false).pipe(
       Effect.catch((error) =>
-        reused && isMcpInvocationError(error) && error.status === 404
+        isMcpInvocationError(error) &&
+        ((reused && error.status === 404) || error.requestNotSent === true)
           ? run(true)
           : Effect.fail(error),
       ),
