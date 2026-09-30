@@ -345,10 +345,14 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Server
   ]);
   const clientDir = opts.clientDir ?? resolve(import.meta.dirname, "../dist");
 
-  startIntegrationsRefresh();
-
   const ownsHandlers = opts.handlers === undefined;
   const handlers = opts.handlers ?? (await getServerHandlers(authToken));
+
+  // Start the 12-hour registry refresh only once handlers (and DB ownership)
+  // are ours. Its fork is never disposed, so starting it before a failed
+  // boot kept a process that attached to an existing owner alive forever.
+  startIntegrationsRefresh();
+
   let viteChild: ViteChild | null = null;
 
   const disposeOwnedResources = async (): Promise<void> => {
