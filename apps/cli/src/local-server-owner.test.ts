@@ -11,7 +11,7 @@ import {
   type ExecutorLocalServerManifest,
 } from "@executor-js/sdk/shared";
 import { isExecutorServerReachable } from "./daemon";
-import { isPidAlive } from "./daemon-state";
+import { acquireDaemonStartLock, isPidAlive } from "./daemon-state";
 import { readLocalServerManifest, writeLocalServerManifest } from "./local-server-manifest";
 import {
   readLocalServerOwnerWaitingOutStall,
@@ -22,6 +22,19 @@ import {
 // its own temp EXECUTOR_DATA_DIR. Nothing here reads or probes a real daemon.
 
 const CLI_MAIN = resolve(import.meta.dirname, "main.ts");
+
+/** Environment for a CLI child: its own data and scope dir, no supervised-mode
+ * takeover, and no network side effects (analytics, registry refresh). */
+const isolatedCliEnv = (dataDir: string): NodeJS.ProcessEnv => {
+  const { EXECUTOR_SUPERVISED: _supervised, ...env } = process.env;
+  return {
+    ...env,
+    EXECUTOR_DATA_DIR: dataDir,
+    EXECUTOR_SCOPE_DIR: dataDir,
+    DO_NOT_TRACK: "1",
+    EXECUTOR_DISABLE_INTEGRATIONS_FETCH: "1",
+  };
+};
 
 const manifestFor = (input: {
   readonly pid: number;
@@ -316,6 +329,13 @@ const MCP_INITIALIZE =
     },
   }) + "\n";
 
+const holdDaemonStartLock = (dataDir: string) =>
+  Effect.runPromise(
+    acquireDaemonStartLock({ hostname: "localhost", scopeId: `scope:${resolve(dataDir)}` }).pipe(
+      Effect.provide(BunServices.layer),
+    ),
+  );
+
 describe("executor mcp with a stalled owner", () => {
   it("waits for the frozen owner and bridges to it instead of starting a daemon", async () => {
     await withTempDataDir(async (dataDir) => {
@@ -323,11 +343,17 @@ describe("executor mcp with a stalled owner", () => {
       let cli: ChildProcess | null = null;
       try {
         await writeManifest(manifestFor({ pid: owner.pid, origin: owner.origin, dataDir }));
+        // `executor mcp` always targets the default port, so a regression that
+        // spawned a daemon here would start one on the real default port. Hold
+        // the daemon start lock for this scope so any spawn attempt waits on
+        // this (live) test process instead of starting anything; the stall
+        // messages asserted below still tell the fixed path from the old one.
+        await holdDaemonStartLock(dataDir);
         const unfreeze = freezeFor(owner.child, 6_000);
 
         let stderr = "";
         cli = spawn(process.execPath, ["run", CLI_MAIN, "mcp"], {
-          env: { ...process.env, EXECUTOR_DATA_DIR: dataDir, EXECUTOR_SCOPE_DIR: dataDir },
+          env: isolatedCliEnv(dataDir),
           stdio: ["pipe", "pipe", "pipe"],
         });
         cli.stderr!.on("data", (chunk) => (stderr += String(chunk)));
@@ -395,7 +421,7 @@ const runCliAutoStart = async (dataDir: string) => {
     process.execPath,
     ["run", CLI_MAIN, "tools", "search", "nothing", "--base-url", `http://localhost:${port}`],
     {
-      env: { ...process.env, EXECUTOR_DATA_DIR: dataDir, EXECUTOR_SCOPE_DIR: dataDir },
+      env: isolatedCliEnv(dataDir),
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -482,7 +508,6 @@ const runDaemonAgainstOwnedDataDir = async (
     await waitFor(() => existsSync(readyFile), 20_000, "lock holder");
     await beforeDaemon();
     const port = await freePort();
-    const { EXECUTOR_SUPERVISED: _supervised, ...env } = process.env;
     daemon = spawn(
       process.execPath,
       [
@@ -497,7 +522,7 @@ const runDaemonAgainstOwnedDataDir = async (
         "localhost",
       ],
       {
-        env: { ...env, EXECUTOR_DATA_DIR: dataDir, EXECUTOR_SCOPE_DIR: dataDir },
+        env: isolatedCliEnv(dataDir),
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
