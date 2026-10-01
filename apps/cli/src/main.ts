@@ -152,6 +152,10 @@ import {
   writeLocalServerManifest,
 } from "./local-server-manifest";
 import {
+  readLocalServerOwnerWaitingOutStall,
+  type LocalServerOwnerStallEvent,
+} from "./local-server-owner";
+import {
   DEFAULT_SERVICE_PORT,
   getServiceBackend,
   SERVICE_LABEL,
@@ -252,6 +256,49 @@ const readReachableLocalServerHint = (): Effect.Effect<
   });
 
 const readActiveLocalServerManifest = readReachableLocalServerHint;
+
+// stderr only: in `executor mcp`, stdout is the JSON-RPC channel.
+const reportLocalServerOwnerStall = (event: LocalServerOwnerStallEvent): void => {
+  switch (event.kind) {
+    case "stalled":
+      console.error(
+        `Executor server pid ${event.manifest.pid} at ${event.manifest.connection.origin} is running but not answering /api/health; waiting up to ${event.budgetMs / 1000}s for it instead of starting another daemon.`,
+      );
+      return;
+    case "recovered":
+      console.error(
+        `Executor server pid ${event.manifest.pid} answered again after ${(event.waitedMs / 1000).toFixed(1)}s (${event.probes} health probes); using it.`,
+      );
+      return;
+    case "gone":
+      console.error(
+        `Executor server pid ${event.pid} exited while we waited ${(event.waitedMs / 1000).toFixed(1)}s for it.`,
+      );
+      return;
+    case "gave-up":
+      console.error(
+        `Executor server pid ${event.manifest.pid} still did not answer /api/health after ${(event.waitedMs / 1000).toFixed(1)}s (${event.probes} health probes); starting a daemon (it exits again if pid ${event.manifest.pid} still owns the data directory).`,
+      );
+      return;
+  }
+};
+
+// Like readActiveLocalServerManifest, but a live owner whose /api/health is
+// briefly silent is waited out instead of read as "no server". Used before any
+// decision to spawn a daemon, so a stalled owner never gets a stray sibling.
+const readLocalServerOwner = (): Effect.Effect<
+  ExecutorLocalServerManifest | null,
+  never,
+  FileSystem.FileSystem | PlatformPath.Path
+> =>
+  readLocalServerOwnerWaitingOutStall({
+    readManifest: readLocalServerManifest(),
+    isReachable: isServerReachable,
+    isPidAlive,
+    removeManifestIfOwnedBy: (pid) =>
+      removeLocalServerManifestIfOwnedBy({ pid }).pipe(Effect.ignore),
+    onStallEvent: reportLocalServerOwnerStall,
+  });
 
 const normalizeDaemonScopeDir = (dir: string): string => {
   const resolved = resolve(dir);
@@ -463,7 +510,8 @@ const resolveDaemonTarget = (baseUrl: string) =>
 
     if (pointer) {
       const pointerUrl = daemonBaseUrl(pointer.hostname, pointer.port);
-      if (isPidAlive(pointer.pid) && (yield* isServerReachable(pointerUrl))) {
+      const pointerPidAlive = isPidAlive(pointer.pid);
+      if (pointerPidAlive && (yield* isServerReachable(pointerUrl))) {
         return {
           baseUrl: pointerUrl,
           hostname: pointer.hostname,
@@ -473,7 +521,11 @@ const resolveDaemonTarget = (baseUrl: string) =>
         };
       }
 
-      yield* cleanupPointer({ hostname: pointer.hostname, scopeId, port: pointer.port });
+      // A live pid that missed one health probe is a stalled daemon, not a
+      // dead one: keep its pointer. Only a dead pid's pointer is stale.
+      if (!pointerPidAlive) {
+        yield* cleanupPointer({ hostname: pointer.hostname, scopeId, port: pointer.port });
+      }
     }
 
     return {
@@ -663,7 +715,7 @@ const ensureDaemon = (
       return resolvedTarget.baseUrl;
     }
 
-    const active = yield* readActiveLocalServerManifest();
+    const active = yield* readLocalServerOwner();
     const activeOrigin = active
       ? normalizeExecutorServerConnection({ origin: active.connection.origin }).origin
       : null;
@@ -864,7 +916,7 @@ const resolveExecutorServerConnection = (
     // The daemon we just ensured published a manifest carrying its bearer token
     // (minted into auth.json). Prefer that authed connection — otherwise the
     // next API call hits the now-gated server with no credential and 401s.
-    const started = yield* readActiveLocalServerManifest().pipe(Effect.orElseSucceed(() => null));
+    const started = yield* readLocalServerOwner();
     const daemonOrigin = normalizeExecutorServerConnection({ origin: daemonUrl }).origin;
     const startedOrigin = started
       ? normalizeExecutorServerConnection({ origin: started.connection.origin }).origin
@@ -1517,9 +1569,9 @@ const runStdioMcpSession = (input: {
     // process became owner first), ensureDaemon may fail, but the winner's
     // manifest is then reachable, so re-read it and bridge to that instead.
     const elected = yield* ensureDaemon(DEFAULT_BASE_URL).pipe(
-      Effect.flatMap(() => readActiveLocalServerManifest()),
+      Effect.flatMap(() => readLocalServerOwner()),
       Effect.catch((error) =>
-        readActiveLocalServerManifest().pipe(
+        readLocalServerOwner().pipe(
           Effect.flatMap((manifest) => (manifest ? Effect.succeed(manifest) : Effect.fail(error))),
         ),
       ),
