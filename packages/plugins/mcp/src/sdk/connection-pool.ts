@@ -125,10 +125,7 @@ export const createMcpConnectionPool = (): McpConnectionPool => {
         const entry = idle.get(key);
         if (!entry) return { connection: undefined, expired: undefined };
         idle.delete(key);
-        if (
-          Date.now() - entry.idleSince >= IDLE_TTL_MS ||
-          entry.connection.isClosed?.() === true
-        ) {
+        if (Date.now() - entry.idleSince >= IDLE_TTL_MS || entry.connection.isClosed?.() === true) {
           return { connection: undefined, expired: entry.connection };
         }
         return { connection: entry.connection, expired: undefined };
