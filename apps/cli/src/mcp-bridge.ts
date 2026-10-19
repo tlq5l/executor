@@ -438,9 +438,10 @@ const isSessionLostError = (error: Error): boolean => {
 };
 
 /** Bun's fetch (~300 s timeout) giving up on the standalone GET event stream
- * of an idle session; the SDK reports it twice and does not reopen it. Calls
- * are unaffected: each POST carries its own response stream, and the daemon
- * sends prompts on the POST of the call they belong to (relatedRequestId).
+ * of an idle session; the SDK reports it twice and does not reopen it. The
+ * daemon sends prompts on the POST of the call they belong to
+ * (relatedRequestId), so losing this stream is harmless. The same timeout also
+ * ends a POST whose call stays silent for 300 s; that call comes back as lost.
  * Not logged; calls in flight are still probed. */
 const isIdleStreamTimeout = (error: Error): boolean =>
   error.name === "TimeoutError" || error.message === "The operation timed out.";

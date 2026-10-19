@@ -103,9 +103,9 @@ const launchdPrint = (label: string): Promise<string | null> =>
 /** Will launchd (re)start this loaded job on its own, judging by its
  * `launchctl print` dump? A job that is running, starting or throttled
  * ("spawn scheduled") will be; so is one that crashed or was killed while a
- * KeepAlive rule applies. One that exited cleanly is not: under KeepAlive
- * SuccessfulExit=false (our LaunchAgent), e.g. after `executor daemon stop`,
- * launchd leaves it down while the job stays loaded. */
+ * KeepAlive rule applies. One that exited cleanly (code 0) is not: under KeepAlive
+ * SuccessfulExit=false (our LaunchAgent) launchd leaves it down while the job
+ * stays loaded. `executor daemon stop` exits 130, so it does get restarted. */
 export const launchdWillRestart = (printOutput: string): boolean => {
   const field = (name: string) =>
     new RegExp(`^\\t${name} = (.*)$`, "m").exec(printOutput)?.[1]?.trim() ?? null;

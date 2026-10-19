@@ -1013,10 +1013,10 @@ const stopDaemon = (
     console.log(`Daemon stopped at ${target.baseUrl}.`);
     const supervisor = yield* readDaemonSupervisorMarker();
     if (supervisor?.kind === "launchd") {
-      // A clean exit: KeepAlive (SuccessfulExit=false) leaves it down, so the
-      // next command or MCP session starts a daemon of its own right away.
+      // The daemon exits 130 on SIGTERM, so KeepAlive (SuccessfulExit=false)
+      // restarts it within the job's throttle interval.
       console.log(
-        `launchd will not restart it (the job stays loaded). To run it under launchd again: launchctl kickstart gui/${process.getuid?.() ?? 0}/${supervisor.label}`,
+        `launchd will restart it shortly. To keep it stopped: launchctl bootout gui/${process.getuid?.() ?? 0}/${supervisor.label}`,
       );
     }
   }).pipe(Effect.mapError(toError));
