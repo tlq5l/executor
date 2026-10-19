@@ -197,7 +197,9 @@ import embeddedWebUI from "./embedded-web-ui.gen";
 // ---------------------------------------------------------------------------
 
 const { version: CLI_VERSION } = await import("../package.json");
-const DEFAULT_PORT = 4788;
+// EXECUTOR_DEFAULT_PORT lets tests (and the bridge fault-injection harness) run
+// `executor mcp` auto-start against a throwaway port instead of the real one.
+const DEFAULT_PORT = Number(process.env.EXECUTOR_DEFAULT_PORT) || 4788;
 /** Canonical public docs (Mintlify), matching the web shell's DEFAULT_DOCS_URL. */
 const DOCS_URL = "https://executor.sh/docs";
 const DEFAULT_BASE_URL = `http://localhost:${DEFAULT_PORT}`;
