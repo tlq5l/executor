@@ -23,10 +23,17 @@ import {
 //
 // - messages that arrive while reconnecting are queued and sent once the new
 //   session is up;
-// - a request whose POST failed never reached the daemon, so it is re-sent;
-// - a request the daemon had accepted but not answered when the session broke
-//   is re-sent only when its method is read-only; otherwise the client gets a
-//   JSON-RPC error saying the outcome is unknown (never silence);
+// - a request that provably never ran (connect refused, or an HTTP answer
+//   such as 404 for a gone session) is re-sent;
+// - a request the daemon may have started when the session broke (its POST
+//   was accepted, or its connection broke mid-request) is re-sent only when
+//   its method is read-only; otherwise the client gets a JSON-RPC error saying
+//   the outcome is unknown (never silence);
+// - a message the live daemon refuses (HTTP 4xx other than 401/404) is not a
+//   lost session: a request gets that error back, anything else is dropped;
+// - sessions that drop right after connecting back off like failed connects;
+// - daemon-to-client request ids are rewritten per session, so a reply meant
+//   for an old session's prompt can never answer a new session's prompt;
 // - queued requests that wait longer than `requestBudgetMs` get an error.
 // ---------------------------------------------------------------------------
 
@@ -71,6 +78,11 @@ const LOST_CALL_ERROR_CODE = -32000;
 /** Ids of requests the bridge itself sends (initialize replay, liveness
  * probe); their answers are consumed here, never forwarded to the client. */
 const INTERNAL_ID_PREFIX = "executor-bridge-";
+/** Prefix of the ids the client sees on daemon-to-client requests. */
+const SERVER_REQUEST_ID_PREFIX = `${INTERNAL_ID_PREFIX}srv-`;
+/** A session that drops sooner than this after connecting counts as a quick
+ * drop: the next reconnect waits, so a refused replay cannot spin. */
+const QUICK_DROP_MS = 2_000;
 
 interface InFlight {
   readonly message: JSONRPCRequest;
@@ -99,18 +111,20 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   const queue: Array<{ message: JSONRPCMessage; queuedAt: number }> = [];
   /** Client requests sent to the daemon and not yet answered. */
   const inFlight = new Map<RequestId, InFlight>();
-  /** Daemon-to-client request ids, tagged with the session they came from. */
-  const serverRequests = new Map<RequestId, number>();
+  /** Daemon-to-client requests by the id the client saw: the session they
+   * came from and the daemon's own id. */
+  const serverRequests = new Map<string, { generation: number; id: RequestId }>();
+  let connectedAt = 0;
+  let quickDrops = 0;
+  const backoffMs = (attempt: number) => Math.min(100 * 2 ** Math.min(attempt, 5), maxBackoffMs);
 
   let resolveExit: () => void = () => {};
   const exited = new Promise<void>((resolve) => {
     resolveExit = resolve;
   });
 
-  const answerWithError = (id: RequestId, message: string) => {
-    void client
-      .send({ jsonrpc: "2.0", id, error: { code: LOST_CALL_ERROR_CODE, message } })
-      .catch(() => {});
+  const answerWithError = (id: RequestId, message: string, code = LOST_CALL_ERROR_CODE) => {
+    void client.send({ jsonrpc: "2.0", id, error: { code, message } }).catch(() => {});
   };
 
   const expireQueuedRequests = () => {
@@ -160,15 +174,23 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
         if (gen !== generation) settleLost(entry.message.id, entry);
       },
       (cause: unknown) => {
-        // The POST failed, so the daemon never handled it: always safe to resend.
         if (entry) inFlight.delete(entry.message.id);
-        if (gen !== generation) {
-          sendOnLink(message, queuedAt);
-          return;
+        if (gen === generation) {
+          const rejection = daemonRejection(cause);
+          if (rejection) {
+            // The session is alive; the daemon refused this one message.
+            log(`daemon refused a message (HTTP ${rejection.status}): ${rejection.message}`);
+            if (entry) answerWithError(entry.message.id, rejection.message, rejection.code);
+            return;
+          }
+          log(`send to daemon failed: ${errorMessage(cause)}`);
+          dropLink(`send failed: ${errorMessage(cause)}`);
         }
-        log(`send to daemon failed: ${errorMessage(cause)}`);
-        queue.unshift({ message, queuedAt });
-        dropLink(`send failed: ${errorMessage(cause)}`);
+        // The daemon does not answer a POST until the call finishes, so a
+        // connection that broke mid-request may have run it. Only an HTTP
+        // answer or a refused connect proves it never ran.
+        if (entry && !neverReachedDaemon(cause)) settleLost(entry.message.id, entry);
+        else sendOnLink(message, queuedAt);
       },
     );
   };
@@ -183,25 +205,30 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
     replayWaiters.set(id, () => {});
     current.transport.send({ jsonrpc: "2.0", id, method: "ping" }).then(undefined, (cause) => {
       replayWaiters.delete(id);
-      if (gen === generation) dropLink(`liveness probe failed: ${errorMessage(cause)}`);
+      // A refused ping still proves the session is alive.
+      if (gen === generation && !daemonRejection(cause)) {
+        dropLink(`liveness probe failed: ${errorMessage(cause)}`);
+      }
     });
   };
 
   const forwardFromClient = (message: JSONRPCMessage) => {
     if (isInitializeRequest(message)) {
-      cachedInitialize = message as JSONRPCRequest;
+      // Replays use the handshake the daemon accepted, not a later repeat.
+      if (!initializeAnswered) cachedInitialize = message as JSONRPCRequest;
     } else if (isInitializedNotification(message)) {
       clientInitialized = true;
-    } else if (
-      (isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) &&
-      message.id !== undefined
-    ) {
-      const from = serverRequests.get(message.id);
-      serverRequests.delete(message.id);
-      if (from !== undefined && from !== generation) {
-        log(`dropping a reply to a request from an earlier daemon session (id ${message.id})`);
+    } else if (isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) {
+      // Every daemon request reached the client under a bridge id, so a reply
+      // with any other id, or for an earlier session, has nowhere to go.
+      const origin = typeof message.id === "string" ? serverRequests.get(message.id) : undefined;
+      if (typeof message.id === "string") serverRequests.delete(message.id);
+      if (!origin || origin.generation !== generation) {
+        log(`dropping a reply to no current daemon request (id ${String(message.id)})`);
         return;
       }
+      sendOnLink({ ...message, id: origin.id }, Date.now());
+      return;
     }
     sendOnLink(message, Date.now());
   };
@@ -221,12 +248,26 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
       if (typeof message.id === "string" && message.id.startsWith(INTERNAL_ID_PREFIX)) return;
       if (cachedInitialize && message.id === cachedInitialize.id) initializeAnswered = true;
       inFlight.delete(message.id);
-    } else if (isJSONRPCRequest(message)) {
-      serverRequests.set(message.id, gen);
     }
-    void client.send(message).catch((cause: unknown) => {
+    void client.send(withClientIds(gen, message)).catch((cause: unknown) => {
       log(`send to client failed: ${errorMessage(cause)}`);
     });
+  };
+
+  /** Daemon requests get a per-session id before the client sees them, so a
+   * new session restarting its ids at 0 cannot collide with an old prompt. */
+  const withClientIds = (gen: number, message: JSONRPCMessage): JSONRPCMessage => {
+    if (isJSONRPCRequest(message)) {
+      const clientId = serverRequestId(gen, message.id);
+      serverRequests.set(clientId, { generation: gen, id: message.id });
+      return { ...message, id: clientId };
+    }
+    if (isCancelledNotification(message)) {
+      // The daemon withdrew one of its own requests: name it as the client saw it.
+      const requestId = serverRequestId(gen, message.params.requestId);
+      return { ...message, params: { ...message.params, requestId } };
+    }
+    return message;
   };
 
   const replayInitialize = (transport: Transport): Promise<boolean> => {
@@ -268,7 +309,10 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   };
 
   const establish = async (): Promise<void> => {
-    let attempt = 0;
+    // A session that dropped right after connecting waits like a failed
+    // connect, so a daemon refusing the replay cannot cause a tight loop.
+    let attempt = quickDrops;
+    if (attempt > 0) await sleep(backoffMs(attempt));
     while (!isClosed()) {
       expireQueuedRequests();
       let next: McpBridgeLink | null = null;
@@ -295,6 +339,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
             if (gen !== generation || isClosed()) return;
             link = next;
             state = "connected";
+            connectedAt = Date.now();
             if (attempt > 0 || generation > 1) log(`reconnected to the daemon at ${next.label}`);
             flushQueue();
             return;
@@ -306,7 +351,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
         closeQuietly(next.transport);
       }
       attempt += 1;
-      await sleep(Math.min(100 * 2 ** Math.min(attempt, 5), maxBackoffMs));
+      await sleep(backoffMs(attempt));
     }
   };
 
@@ -314,12 +359,17 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
     if (state === "closed" || state === "connecting") return;
     log(`lost the daemon session (${reason}); reconnecting`);
     state = "connecting";
+    quickDrops = Date.now() - connectedAt < QUICK_DROP_MS ? quickDrops + 1 : 0;
     const old = link;
     link = null;
     generation += 1; // retire the old session's callbacks
     if (old) closeQuietly(old.transport);
+    // Prompts from the old session can no longer be answered.
+    for (const [clientId, origin] of serverRequests) {
+      if (origin.generation !== generation) serverRequests.delete(clientId);
+    }
     // Requests the daemon had accepted but not answered. Ones whose POST is
-    // still pending are settled when it resolves (accepted) or fails (resent).
+    // still pending are settled when it resolves or fails.
     for (const [id, entry] of inFlight) {
       if (entry.accepted) settleLost(id, entry);
     }
@@ -364,6 +414,69 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
 const isSessionLostError = (error: Error): boolean => {
   const text = error.message.toLowerCase();
   return text.includes("failed to reconnect") || text.includes("maximum reconnection attempts");
+};
+
+const serverRequestId = (generation: number, id: RequestId) =>
+  `${SERVER_REQUEST_ID_PREFIX}${generation}-${typeof id === "number" ? "n" : "s"}${id}`;
+
+const isCancelledNotification = (
+  message: JSONRPCMessage,
+): message is JSONRPCMessage & {
+  method: "notifications/cancelled";
+  params: { requestId: RequestId };
+} =>
+  "method" in message &&
+  !("id" in message) &&
+  message.method === "notifications/cancelled" &&
+  typeof message.params === "object" &&
+  message.params !== null &&
+  "requestId" in message.params;
+
+/** The HTTP status of the SDK's StreamableHTTPError (the daemon answered),
+ * or null for anything else. Duck-typed: the SDK error is not tagged. */
+const httpStatus = (cause: unknown): number | null => {
+  if (!(cause instanceof Error) || !cause.message.startsWith("Streamable HTTP error")) return null;
+  const { code } = cause as { code?: unknown };
+  return typeof code === "number" && code > 0 ? code : null;
+};
+
+/** A POST the daemon answered with a 4xx while its session is still alive:
+ * it refused that one message. 404 (session not found) and 401 (a restarted
+ * daemon with a new token) mean the session is gone, so they are not this. */
+const daemonRejection = (
+  cause: unknown,
+): { status: number; code: number; message: string } | null => {
+  const status = httpStatus(cause);
+  if (status === null || status < 400 || status >= 500) return null;
+  if (status === 404 || status === 401) return null;
+  // The SDK puts the response body after this prefix; the daemon sends a
+  // JSON-RPC error there, whose code and text are passed on when present.
+  const text = (cause as Error).message;
+  const body = text.split("Error POSTing to endpoint: ")[1] ?? "";
+  try {
+    const parsed = JSON.parse(body) as { error?: { code?: unknown; message?: unknown } };
+    if (typeof parsed.error?.message === "string") {
+      return {
+        status,
+        code: typeof parsed.error.code === "number" ? parsed.error.code : -32600,
+        message: parsed.error.message,
+      };
+    }
+  } catch {}
+  return { status, code: -32600, message: body || text };
+};
+
+/** The POST failed in a way that proves the daemon never ran it: it answered
+ * with an HTTP status, or the connection was refused before any request. */
+const neverReachedDaemon = (cause: unknown): boolean => {
+  if (httpStatus(cause) !== null) return true;
+  for (let current = cause, depth = 0; current && depth < 4; depth++) {
+    const { code, message } = current as { code?: unknown; message?: unknown };
+    if (code === "ConnectionRefused" || code === "ECONNREFUSED") return true;
+    if (typeof message === "string" && message.includes("Unable to connect")) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
 };
 
 const closeQuietly = (transport: Transport) => {

@@ -3,7 +3,9 @@
  *
  * Runs real bridges (`main.ts mcp`) against a real daemon on a random free port
  * with a throwaway data dir, injects daemon restarts / session kills / idle
- * gaps, and counts calls that never got a successful answer ("dropped").
+ * gaps, and counts calls that never got a successful answer ("dropped"). A
+ * call the bridge reports as lost (the daemon died while running it, so its
+ * outcome is unknown) is the designed answer, not a drop; it is counted apart.
  *
  *   bun run apps/cli/src/bridge-reliability.harness.ts [a b c d e]
  *
@@ -20,7 +22,24 @@ import { join, resolve } from "node:path";
 const CLI_MAIN = resolve(import.meta.dirname, "main.ts");
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-export type CallOutcome = "ok" | "error" | "timeout" | "exited";
+export type CallOutcome = "ok" | "lost" | "error" | "timeout" | "exited";
+
+/** Text of the bridge's error for a call the daemon accepted and then died. */
+const LOST_CALL_TEXT = "restarted while this call was running";
+
+/** Every daemon and bridge process and data dir still alive, so an
+ * interrupted run (Ctrl-C) can clean up instead of leaving daemons behind. */
+const liveChildren = new Set<ChildProcess>();
+const liveSandboxes = new Set<Sandbox>();
+const track = (child: ChildProcess) => {
+  liveChildren.add(child);
+  child.once("exit", () => liveChildren.delete(child));
+  return child;
+};
+const disposeEverything = () => {
+  for (const child of liveChildren) child.kill("SIGKILL");
+  for (const sandbox of liveSandboxes) sandbox.dispose();
+};
 
 export interface ScenarioResult {
   readonly name: string;
@@ -89,7 +108,9 @@ const waitForExit = (child: ChildProcess, ms: number): Promise<boolean> =>
 class Sandbox {
   readonly dataDir = mkdtempSync(join(tmpdir(), "executor-bridge-rel-"));
   readonly bridgeLogs: Array<() => string> = [];
-  constructor(readonly port: number) {}
+  constructor(readonly port: number) {
+    liveSandboxes.add(this);
+  }
 
   env(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     const { EXECUTOR_SUPERVISED: _s, EXECUTOR_DAEMON_SUPERVISOR: _d, ...env } = process.env;
@@ -138,6 +159,7 @@ class Sandbox {
   }
 
   dispose() {
+    liveSandboxes.delete(this);
     this.killOwner();
     rmSync(this.dataDir, { recursive: true, force: true });
   }
@@ -160,26 +182,28 @@ class Supervisor {
 
   start() {
     this.starts += 1;
-    const child = spawn(
-      process.execPath,
-      [
-        "run",
-        CLI_MAIN,
-        "daemon",
-        "run",
-        "--port",
-        String(this.sandbox.port),
-        "--hostname",
-        "localhost",
-        "--foreground",
-      ],
-      {
-        env: this.sandbox.env({
-          EXECUTOR_SUPERVISED: "1",
-          EXECUTOR_DAEMON_SUPERVISOR: `pid:${process.pid}`,
-        }),
-        stdio: ["ignore", "ignore", "pipe"],
-      },
+    const child = track(
+      spawn(
+        process.execPath,
+        [
+          "run",
+          CLI_MAIN,
+          "daemon",
+          "run",
+          "--port",
+          String(this.sandbox.port),
+          "--hostname",
+          "localhost",
+          "--foreground",
+        ],
+        {
+          env: this.sandbox.env({
+            EXECUTOR_SUPERVISED: "1",
+            EXECUTOR_DAEMON_SUPERVISOR: `pid:${process.pid}`,
+          }),
+          stdio: ["ignore", "ignore", "pipe"],
+        },
+      ),
     );
     child.stderr!.on("data", (chunk) => (this.stderr += String(chunk)));
     child.once("exit", () => {
@@ -230,10 +254,12 @@ class Bridge {
     readonly label: string,
     private readonly callTimeoutMs: number,
   ) {
-    this.child = spawn(process.execPath, ["run", CLI_MAIN, "mcp"], {
-      env: sandbox.env(),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    this.child = track(
+      spawn(process.execPath, ["run", CLI_MAIN, "mcp"], {
+        env: sandbox.env(),
+        stdio: ["pipe", "pipe", "pipe"],
+      }),
+    );
     this.child.stderr!.on("data", (chunk) => (this.stderr += String(chunk)));
     sandbox.bridgeLogs.push(() => this.stderr);
     this.child.stdout!.on("data", (chunk) => this.onData(String(chunk)));
@@ -252,7 +278,11 @@ class Bridge {
       this.buffer = this.buffer.slice(newline + 1);
       newline = this.buffer.indexOf("\n");
       if (!line) continue;
-      let message: { id?: unknown; result?: unknown; error?: { message?: string } };
+      let message: {
+        id?: unknown;
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+        error?: { message?: string };
+      };
       try {
         message = JSON.parse(line);
       } catch {
@@ -262,8 +292,12 @@ class Bridge {
       const pending = this.pending.get(message.id);
       if (!pending) continue;
       this.pending.delete(message.id);
-      if (message.error) pending.resolve("error", message.error.message);
-      else pending.resolve("ok");
+      if (message.error?.message?.includes(LOST_CALL_TEXT)) pending.resolve("lost");
+      else if (message.error) pending.resolve("error", message.error.message);
+      // A failed tool call is a result with isError, not a JSON-RPC error.
+      else if (message.result?.isError) {
+        pending.resolve("error", `tool error: ${message.result.content?.[0]?.text ?? ""}`);
+      } else pending.resolve("ok");
     }
   }
 
@@ -308,9 +342,11 @@ class Bridge {
 
   /** Alternate a cheap list with a cheap code-mode execute. */
   call(n: number) {
-    return n % 2 === 0
-      ? this.request("tools/list")
-      : this.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
+    return n % 2 === 0 ? this.request("tools/list") : this.execute("return 1");
+  }
+
+  execute(code: string) {
+    return this.request("tools/call", { name: "execute", arguments: { code } });
   }
 
   kill(signal: NodeJS.Signals) {
@@ -329,12 +365,18 @@ class Bridge {
 // ---------------------------------------------------------------------------
 
 class Tally {
-  readonly outcomes: Record<CallOutcome, number> = { ok: 0, error: 0, timeout: 0, exited: 0 };
+  readonly outcomes: Record<CallOutcome, number> = {
+    ok: 0,
+    lost: 0,
+    error: 0,
+    timeout: 0,
+    exited: 0,
+  };
   readonly notes: Array<string> = [];
 
   record(label: string, n: number, result: { outcome: CallOutcome; detail?: string }) {
     this.outcomes[result.outcome] += 1;
-    if (result.outcome !== "ok" && this.notes.length < 12) {
+    if (result.outcome !== "ok" && result.outcome !== "lost" && this.notes.length < 12) {
       this.notes.push(
         `${label}#${n} ${result.outcome}${result.detail ? `: ${result.detail}` : ""}`,
       );
@@ -346,7 +388,7 @@ class Tally {
     return {
       name,
       total,
-      dropped: total - this.outcomes.ok,
+      dropped: total - this.outcomes.ok - this.outcomes.lost,
       bridgeSpawns,
       outcomes: this.outcomes,
       notes: this.notes,
@@ -506,18 +548,60 @@ export const scenarioSupervisorTakeover = (opts: HarnessOptions) =>
     });
   });
 
+/** f. The daemon is SIGKILLed while calls are running on it: a slow execute
+ * must come back as lost (never silence, never a hang), and a read-only list
+ * in flight at the same moment must be resent and succeed. */
+export const scenarioKillInFlight = (opts: HarnessOptions) =>
+  withSandbox("f-kill-in-flight", async (sandbox, tally, cleanup) => {
+    const supervisor = new Supervisor(sandbox, opts.restartDelayMs);
+    cleanup.push(() => supervisor.stop());
+    supervisor.start();
+    await supervisor.waitReady();
+    const bridge = new Bridge(sandbox, "f", opts.callTimeoutMs);
+    cleanup.push(() => bridge.dispose());
+    await bridge.initialize();
+    const rounds = Math.max(2, Math.floor(opts.calls / 10));
+    for (let round = 0; round < rounds; round++) {
+      const slow = bridge.execute(
+        'await tools.search({ query: "x" }); const end = Date.now() + 3000; while (Date.now() < end) {} return 1',
+      );
+      const lists = [0, 1, 2].map(() => bridge.request("tools/list"));
+      await sleep(1_000);
+      const pid = supervisor.child?.pid ?? null;
+      supervisor.kill("SIGKILL");
+      tally.record("f-slow", round, await slow);
+      for (const [i, list] of lists.entries()) tally.record(`f-list${i}`, round, await list);
+      // Let the supervisor's replacement come up before the next round.
+      while (supervisor.child?.pid === pid) await sleep(50);
+      await supervisor.waitReady();
+      tally.record("f-after", round, await bridge.call(1));
+    }
+    if (tally.outcomes.lost === 0) {
+      tally.notes.push(
+        "no call was in flight when the daemon died; the lost-call path did not run",
+      );
+    }
+  });
+
 export const SCENARIOS = {
   a: scenarioDaemonRestart,
   b: scenarioSpawnerKilled,
   c: scenarioLongIdle,
   d: scenarioConcurrentRestart,
   e: scenarioSupervisorTakeover,
+  f: scenarioKillInFlight,
 } as const;
 
 export const formatMetric = (r: Pick<ScenarioResult, "dropped" | "total">, name?: string) =>
   `METRIC${name ? ` scenario=${name}` : ""} dropped=${r.dropped} total=${r.total}`;
 
 if (import.meta.main) {
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.once(signal, () => {
+      disposeEverything();
+      process.exit(130);
+    });
+  }
   const opts = defaultHarnessOptions();
   const picked = (
     process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(SCENARIOS)
