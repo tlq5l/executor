@@ -78,6 +78,13 @@ import * as Cause from "effect/Cause";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { runMcpBridge } from "./mcp-bridge";
+import {
+  daemonSupervisorFromEnv,
+  daemonSupervisorStatus,
+  describeDaemonSupervisor,
+  readDaemonSupervisorMarker,
+  writeDaemonSupervisorMarker,
+} from "./daemon-supervisor";
 
 import { ExecutorApi, checkForUpdate } from "@executor-js/api";
 import {
@@ -1266,6 +1273,13 @@ const runDaemonSession = (input: {
       // and crash-loop under KeepAlive. (Found by a real reboot test with
       // integration data in the DB.)
       if (process.env.EXECUTOR_SUPERVISED) {
+        // Tell bridges an OS supervisor owns the daemon before taking over, so
+        // they wait for it instead of spawning their own in the gap (see
+        // daemon-supervisor.ts).
+        const supervisor = daemonSupervisorFromEnv(process.env);
+        if (supervisor) {
+          yield* writeDaemonSupervisorMarker(supervisor).pipe(Effect.ignore);
+        }
         yield* takeOverActiveLocalServer().pipe(Effect.ignore);
       } else {
         yield* assertNoOtherActiveLocalServer();
@@ -1497,6 +1511,39 @@ const runMcpHttpBridge = async (input: {
   }
 };
 
+/** How long a bridge waits for a supervisor it cannot check before it falls
+ * back to spawning a daemon itself. */
+const UNCHECKABLE_SUPERVISOR_GRACE_MS = 30_000;
+let supervisorWaitStartedAt: number | null = null;
+
+/** True when an OS supervisor owns the daemon and is still registered: the
+ * caller should wait for it to bring the daemon back rather than spawn one. */
+const waitForDaemonSupervisor = (): Effect.Effect<
+  boolean,
+  never,
+  FileSystem.FileSystem | PlatformPath.Path
+> =>
+  Effect.gen(function* () {
+    const supervisor = yield* readDaemonSupervisorMarker();
+    if (!supervisor) return false;
+    const status = yield* Effect.promise(() => daemonSupervisorStatus(supervisor));
+    if (status === "gone") {
+      supervisorWaitStartedAt = null;
+      return false;
+    }
+    const now = Date.now();
+    if (supervisorWaitStartedAt === null) {
+      supervisorWaitStartedAt = now;
+      console.error(
+        `Executor MCP bridge: the daemon is down; waiting for the ${describeDaemonSupervisor(supervisor)} to restart it.`,
+      );
+    }
+    if (status === "unknown" && now - supervisorWaitStartedAt > UNCHECKABLE_SUPERVISOR_GRACE_MS) {
+      return false;
+    }
+    return true;
+  });
+
 /** The reachable local owner, starting a daemon on demand when there is none.
  * Null when no owner could be found or started this time (the bridge retries). */
 const resolveBridgeOwner = (): Effect.Effect<
@@ -1506,7 +1553,11 @@ const resolveBridgeOwner = (): Effect.Effect<
 > =>
   Effect.gen(function* () {
     const active = yield* readActiveLocalServerManifest();
-    if (active) return active;
+    if (active) {
+      supervisorWaitStartedAt = null;
+      return active;
+    }
+    if (yield* waitForDaemonSupervisor()) return null;
     // No reachable owner yet: ensure one. If we lose the election (another
     // process became owner first), ensureDaemon may fail, but the winner's
     // manifest is then reachable, so re-read it and bridge to that instead.

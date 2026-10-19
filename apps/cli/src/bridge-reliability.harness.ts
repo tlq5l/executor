@@ -26,8 +26,12 @@ export interface ScenarioResult {
   readonly name: string;
   readonly total: number;
   readonly dropped: number;
+  /** Daemons started by bridges (should be 0 whenever a supervisor owns it). */
+  readonly bridgeSpawns: number;
   readonly outcomes: Record<CallOutcome, number>;
   readonly notes: ReadonlyArray<string>;
+  /** Bridge stderr, for BRIDGE_DEBUG. */
+  readonly debug?: string;
 }
 
 export interface HarnessOptions {
@@ -84,6 +88,7 @@ const waitForExit = (child: ChildProcess, ms: number): Promise<boolean> =>
 
 class Sandbox {
   readonly dataDir = mkdtempSync(join(tmpdir(), "executor-bridge-rel-"));
+  readonly bridgeLogs: Array<() => string> = [];
   constructor(readonly port: number) {}
 
   env(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -171,7 +176,7 @@ class Supervisor {
       {
         env: this.sandbox.env({
           EXECUTOR_SUPERVISED: "1",
-          EXECUTOR_DAEMON_SUPERVISOR: `harness:${process.pid}`,
+          EXECUTOR_DAEMON_SUPERVISOR: `pid:${process.pid}`,
         }),
         stdio: ["ignore", "ignore", "pipe"],
       },
@@ -230,6 +235,7 @@ class Bridge {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child.stderr!.on("data", (chunk) => (this.stderr += String(chunk)));
+    sandbox.bridgeLogs.push(() => this.stderr);
     this.child.stdout!.on("data", (chunk) => this.onData(String(chunk)));
     this.child.stdin!.on("error", () => {});
     this.child.once("exit", () => {
@@ -333,9 +339,16 @@ class Tally {
     }
   }
 
-  result(name: string): ScenarioResult {
+  result(name: string, bridgeSpawns: number): ScenarioResult {
     const total = Object.values(this.outcomes).reduce((a, b) => a + b, 0);
-    return { name, total, dropped: total - this.outcomes.ok, outcomes: this.outcomes, notes: this.notes };
+    return {
+      name,
+      total,
+      dropped: total - this.outcomes.ok,
+      bridgeSpawns,
+      outcomes: this.outcomes,
+      notes: this.notes,
+    };
   }
 }
 
@@ -368,7 +381,11 @@ const withSandbox = async (
     for (const fn of cleanup.reverse()) await Promise.resolve(fn()).catch(() => {});
     sandbox.dispose();
   }
-  return tally.result(name);
+  const spawns = sandbox.bridgeLogs
+    .map((log) => log().split("Starting daemon on").length - 1)
+    .reduce((a, b) => a + b, 0);
+  const debug = sandbox.bridgeLogs.map((log) => log()).join("\n---\n");
+  return { ...tally.result(name, spawns), debug };
 };
 
 // ---------------------------------------------------------------------------
@@ -507,9 +524,10 @@ if (import.meta.main) {
     dropped += result.dropped;
     total += result.total;
     console.log(
-      `${formatMetric(result, result.name)} outcomes=${JSON.stringify(result.outcomes)} secs=${Math.round((Date.now() - started) / 1000)}`,
+      `${formatMetric(result, result.name)} bridge_spawns=${result.bridgeSpawns} outcomes=${JSON.stringify(result.outcomes)} secs=${Math.round((Date.now() - started) / 1000)}`,
     );
     for (const note of result.notes) console.log(`  ${note}`);
+    if (process.env.BRIDGE_DEBUG) console.log(result.debug);
   }
   console.log(formatMetric({ dropped, total }));
   process.exit(0);
