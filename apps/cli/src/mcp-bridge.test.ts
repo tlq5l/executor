@@ -246,4 +246,105 @@ describe("runMcpBridge", () => {
     stop();
     await done;
   });
+
+  it("drops a notification the daemon keeps refusing once it is older than the budget", async () => {
+    const client = new FakeTransport();
+    const abort = new AbortController();
+    let connects = 0;
+    const done = runMcpBridge({
+      client,
+      signal: abort.signal,
+      log: () => {},
+      maxBackoffMs: 20,
+      requestBudgetMs: 200,
+      connect: async () => {
+        connects += 1;
+        const daemon = fakeDaemon();
+        const answer = daemon.onSend;
+        daemon.onSend = async (message) => {
+          if ("method" in message && message.method === "notifications/roots/list_changed") {
+            throw new StreamableHTTPError(404, "Error POSTing to endpoint: Session not found");
+          }
+          return answer(message);
+        };
+        return { transport: daemon, label: `daemon-${connects}` };
+      },
+    });
+    await tick();
+    client.deliver(INITIALIZE);
+    client.deliver({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await tick();
+    client.deliver({ jsonrpc: "2.0", method: "notifications/roots/list_changed" });
+    await tick(600);
+    const settled = connects;
+    await tick(600);
+    // Without an expiry the bridge opens a new daemon session forever.
+    expect(connects).toBe(settled);
+    abort.abort();
+    await done;
+  });
+
+  it("reconnects when a send fails in the same microtask as the queue flush", async () => {
+    const client = new FakeTransport();
+    const abort = new AbortController();
+    let refuse = false;
+    const daemons: Array<FakeTransport> = [];
+    const done = runMcpBridge({
+      client,
+      signal: abort.signal,
+      log: () => {},
+      maxBackoffMs: 20,
+      connect: async () => {
+        const daemon = fakeDaemon();
+        const answer = daemon.onSend;
+        // Not async: an already-rejected promise settles before establish()
+        // returns, so the drop runs while the reconnect is still marked busy.
+        daemon.send = (message) => {
+          daemon.sent.push(message);
+          if (
+            refuse &&
+            "method" in message &&
+            message.method === "notifications/roots/list_changed"
+          ) {
+            return Promise.reject(
+              new StreamableHTTPError(404, "Error POSTing to endpoint: Session not found"),
+            );
+          }
+          return answer(message);
+        };
+        daemons.push(daemon);
+        return { transport: daemon, label: `daemon-${daemons.length}` };
+      },
+    });
+    await tick();
+    client.deliver(INITIALIZE);
+    client.deliver({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await tick();
+    refuse = true;
+    client.deliver({ jsonrpc: "2.0", method: "notifications/roots/list_changed" });
+    await tick(200);
+    refuse = false;
+    await tick(200);
+    client.deliver(request(9, "tools/list"));
+    await tick(200);
+    expect(daemons.some((daemon) => daemon.sent.some((m) => "id" in m && m.id === 9))).toBe(true);
+    abort.abort();
+    await done;
+  });
+
+  it("resends an initialize whose session dropped before it was answered", async () => {
+    const first = new FakeTransport(); // accepts initialize, never answers it
+    const second = fakeDaemon();
+    const { client, stop, done } = startBridge([first, second]);
+    await tick();
+    client.deliver(INITIALIZE);
+    await tick();
+    first.onerror?.(new Error("Maximum reconnection attempts (2) exceeded."));
+    await tick(100);
+
+    expect(second.sent.map((m) => ("method" in m ? m.method : "reply"))).toEqual(["initialize"]);
+    expect(clientReplies(client).find((m) => m.id === 1)).toMatchObject({ result: {} });
+    stop();
+    await done;
+  });
 });

@@ -1511,13 +1511,19 @@ const runMcpHttpBridge = async (input: {
   }
 };
 
-/** How long a bridge waits for a supervisor it cannot check before it falls
- * back to spawning a daemon itself. */
-const UNCHECKABLE_SUPERVISOR_GRACE_MS = 30_000;
+/** How long a bridge waits for the supervisor to bring the daemon back before
+ * it starts one itself. A registered supervisor may still never restart it:
+ * launchd's KeepAlive (SuccessfulExit=false) leaves a daemon that exited
+ * cleanly, e.g. after `executor daemon stop`, down while the job stays loaded.
+ * launchd's own restart throttle is 10 s, well inside this. */
+const SUPERVISOR_GRACE_MS = 30_000;
+/** When the current wait for the supervisor began; null while the daemon is
+ * reachable, so every later outage gets its own grace period. */
 let supervisorWaitStartedAt: number | null = null;
 
-/** True when an OS supervisor owns the daemon and is still registered: the
- * caller should wait for it to bring the daemon back rather than spawn one. */
+/** True while an OS supervisor owns the daemon and may still restart it: the
+ * caller should wait rather than spawn one. False once it is gone or has not
+ * restarted the daemon within the grace period. */
 const waitForDaemonSupervisor = (): Effect.Effect<
   boolean,
   never,
@@ -1535,13 +1541,10 @@ const waitForDaemonSupervisor = (): Effect.Effect<
     if (supervisorWaitStartedAt === null) {
       supervisorWaitStartedAt = now;
       console.error(
-        `Executor MCP bridge: the daemon is down; waiting for the ${describeDaemonSupervisor(supervisor)} to restart it.`,
+        `Executor MCP bridge: the daemon is down; waiting up to ${SUPERVISOR_GRACE_MS / 1000}s for the ${describeDaemonSupervisor(supervisor)} to restart it.`,
       );
     }
-    if (status === "unknown" && now - supervisorWaitStartedAt > UNCHECKABLE_SUPERVISOR_GRACE_MS) {
-      return false;
-    }
-    return true;
+    return now - supervisorWaitStartedAt <= SUPERVISOR_GRACE_MS;
   });
 
 /** The reachable local owner, starting a daemon on demand when there is none.
@@ -1561,7 +1564,7 @@ const resolveBridgeOwner = (): Effect.Effect<
     // No reachable owner yet: ensure one. If we lose the election (another
     // process became owner first), ensureDaemon may fail, but the winner's
     // manifest is then reachable, so re-read it and bridge to that instead.
-    return yield* ensureDaemon(DEFAULT_BASE_URL).pipe(
+    const owner = yield* ensureDaemon(DEFAULT_BASE_URL).pipe(
       Effect.flatMap(() => readLocalServerOwner()),
       Effect.catch((error) =>
         readLocalServerOwner().pipe(
@@ -1573,6 +1576,9 @@ const resolveBridgeOwner = (): Effect.Effect<
         ),
       ),
     );
+    // The outage is over: the next one waits for the supervisor again.
+    if (owner) supervisorWaitStartedAt = null;
+    return owner;
   });
 
 const runStdioMcpSession = (input: {

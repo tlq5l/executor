@@ -7,6 +7,7 @@ import {
   scenarioIdleRestart,
   scenarioKillInFlight,
   scenarioSpawnerKilled,
+  scenarioSupervisorNeverRestarts,
   scenarioSupervisorTakeover,
   type ScenarioResult,
 } from "./bridge-reliability.harness";
@@ -52,4 +53,10 @@ describe("executor mcp bridge under daemon faults", () => {
     expectNoDrops(result);
     expect(result.bridgeSpawns).toBe(1);
   }, 120_000);
+
+  it("starts its own daemon when a registered supervisor never restarts it, on every drop", async () => {
+    const result = await scenarioSupervisorNeverRestarts(options);
+    expectNoDrops(result);
+    expect(result.bridgeSpawns).toBe(2);
+  }, 180_000);
 });

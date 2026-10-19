@@ -27,14 +27,16 @@ import {
 //   such as 404 for a gone session) is re-sent;
 // - a request the daemon may have started when the session broke (its POST
 //   was accepted, or its connection broke mid-request) is re-sent only when
-//   its method is read-only; otherwise the client gets a JSON-RPC error saying
-//   the outcome is unknown (never silence);
+//   its method is safe to repeat (read-only, or `initialize`); otherwise the
+//   client gets a JSON-RPC error saying the outcome is unknown (never silence);
 // - a message the live daemon refuses (HTTP 4xx other than 401/404) is not a
 //   lost session: a request gets that error back, anything else is dropped;
 // - sessions that drop right after connecting back off like failed connects;
 // - daemon-to-client request ids are rewritten per session, so a reply meant
 //   for an old session's prompt can never answer a new session's prompt;
-// - queued requests that wait longer than `requestBudgetMs` get an error.
+// - queued requests that wait longer than `requestBudgetMs` get an error;
+//   queued notifications and replies that old are dropped, so one the daemon
+//   keeps refusing cannot reopen sessions forever.
 // ---------------------------------------------------------------------------
 
 export interface McpBridgeLink {
@@ -60,9 +62,11 @@ export interface McpBridgeOptions {
   readonly signal?: AbortSignal;
 }
 
-/** Methods that only read daemon state: safe to re-send after a drop even if
- * the daemon may already have run them. */
-const READ_ONLY_METHODS = new Set([
+/** Methods safe to re-send after a drop even if the daemon may already have
+ * run them: they only read daemon state, or (`initialize`) only set up the
+ * session that is gone, so the new session needs it anyway. */
+const RESENDABLE_METHODS = new Set([
+  "initialize",
   "ping",
   "tools/list",
   "resources/list",
@@ -127,16 +131,21 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
     void client.send({ jsonrpc: "2.0", id, error: { code, message } }).catch(() => {});
   };
 
-  const expireQueuedRequests = () => {
+  const expireQueued = () => {
     const now = Date.now();
     for (let i = queue.length - 1; i >= 0; i--) {
       const entry = queue[i]!;
-      if (isJSONRPCRequest(entry.message) && now - entry.queuedAt > requestBudgetMs) {
-        queue.splice(i, 1);
+      if (now - entry.queuedAt <= requestBudgetMs) continue;
+      queue.splice(i, 1);
+      const seconds = Math.round(requestBudgetMs / 1000);
+      if (isJSONRPCRequest(entry.message)) {
         answerWithError(
           entry.message.id,
-          `The Executor daemon was unreachable for ${Math.round(requestBudgetMs / 1000)}s; the call was not sent. Retry once it is back.`,
+          `The Executor daemon was unreachable for ${seconds}s; the call was not sent. Retry once it is back.`,
         );
+      } else {
+        const what = "method" in entry.message ? entry.message.method : "reply";
+        log(`dropping a queued ${what} the daemon did not take within ${seconds}s`);
       }
     }
   };
@@ -145,7 +154,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
    * when that is safe, otherwise tell the client its result was lost. */
   const settleLost = (id: RequestId, entry: InFlight) => {
     inFlight.delete(id);
-    if (READ_ONLY_METHODS.has(entry.message.method)) {
+    if (RESENDABLE_METHODS.has(entry.message.method)) {
       sendOnLink(entry.message, entry.queuedAt);
     } else {
       answerWithError(
@@ -297,6 +306,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   };
 
   const flushQueue = () => {
+    expireQueued();
     const pending = queue.splice(0, queue.length);
     for (const entry of pending) sendOnLink(entry.message, entry.queuedAt);
   };
@@ -305,6 +315,9 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   const reconnect = () => {
     reconnecting ??= establish().finally(() => {
       reconnecting = null;
+      // A send that failed during the queue flush can drop the new session
+      // before this runs; its reconnect() found this one still busy.
+      if (state === "connecting") reconnect();
     });
   };
 
@@ -314,7 +327,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
     let attempt = quickDrops;
     if (attempt > 0) await sleep(backoffMs(attempt));
     while (!isClosed()) {
-      expireQueuedRequests();
+      expireQueued();
       let next: McpBridgeLink | null = null;
       try {
         next = await options.connect();
@@ -392,7 +405,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   client.onerror = (error) => log(`stdio transport error: ${error.message}`);
 
   if (options.signal?.aborted) return;
-  const expiry = setInterval(expireQueuedRequests, 1_000);
+  const expiry = setInterval(expireQueued, 1_000);
   expiry.unref?.();
   options.signal?.addEventListener("abort", shutdown, { once: true });
 
@@ -467,7 +480,11 @@ const daemonRejection = (
 };
 
 /** The POST failed in a way that proves the daemon never ran it: it answered
- * with an HTTP status, or the connection was refused before any request. */
+ * with an HTTP status, or the connection was refused before any request.
+ * Known gap, left on purpose: a 5xx counts too, though the daemon may have
+ * started the call before failing, so a non-read-only call can be re-sent and
+ * run twice. A daemon 5xx is an unhandled server error and rare; revisit if
+ * the daemon starts answering 5xx for calls it ran. */
 const neverReachedDaemon = (cause: unknown): boolean => {
   if (httpStatus(cause) !== null) return true;
   for (let current = cause, depth = 0; current && depth < 4; depth++) {

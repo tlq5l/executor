@@ -7,7 +7,7 @@
  * call the bridge reports as lost (the daemon died while running it, so its
  * outcome is unknown) is the designed answer, not a drop; it is counted apart.
  *
- *   bun run apps/cli/src/bridge-reliability.harness.ts [a b c d e]
+ *   bun run apps/cli/src/bridge-reliability.harness.ts [a b c d e f g h]
  *
  * Env: BRIDGE_IDLE_MS (scenario c idle gap, default 5000), BRIDGE_RESTART_DELAY_MS
  * (supervisor restart delay, default 1000), BRIDGE_CALLS (calls per bridge,
@@ -48,6 +48,8 @@ export interface ScenarioResult {
   /** Daemons started by bridges (should be 0 whenever a supervisor owns it). */
   readonly bridgeSpawns: number;
   readonly outcomes: Record<CallOutcome, number>;
+  /** Longest single call, in ms (a recovery shows up here). */
+  readonly maxCallMs: number;
   readonly notes: ReadonlyArray<string>;
   /** Bridge stderr, for BRIDGE_DEBUG. */
   readonly debug?: string;
@@ -166,7 +168,9 @@ class Sandbox {
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor: restarts the daemon after it exits, like a launchd KeepAlive job
+// Supervisor: restarts the daemon after it exits, like a launchd KeepAlive job.
+// With `restarts: false` it stays alive (registered) but never restarts the
+// daemon, like launchd after a clean exit under SuccessfulExit=false.
 // ---------------------------------------------------------------------------
 
 class Supervisor {
@@ -178,6 +182,7 @@ class Supervisor {
   constructor(
     private readonly sandbox: Sandbox,
     private readonly restartDelayMs: number,
+    private readonly restarts = true,
   ) {}
 
   start() {
@@ -207,7 +212,7 @@ class Supervisor {
     );
     child.stderr!.on("data", (chunk) => (this.stderr += String(chunk)));
     child.once("exit", () => {
-      if (this.stopped) return;
+      if (this.stopped || !this.restarts) return;
       setTimeout(() => {
         if (!this.stopped) this.start();
       }, this.restartDelayMs);
@@ -373,6 +378,7 @@ class Tally {
     exited: 0,
   };
   readonly notes: Array<string> = [];
+  maxCallMs = 0;
 
   record(label: string, n: number, result: { outcome: CallOutcome; detail?: string }) {
     this.outcomes[result.outcome] += 1;
@@ -391,6 +397,7 @@ class Tally {
       dropped: total - this.outcomes.ok - this.outcomes.lost,
       bridgeSpawns,
       outcomes: this.outcomes,
+      maxCallMs: this.maxCallMs,
       notes: this.notes,
     };
   }
@@ -405,7 +412,10 @@ const runCalls = async (input: {
 }) => {
   for (let n = 0; n < input.count; n++) {
     await input.onCall?.(n);
-    input.tally.record(input.bridge.label, n, await input.bridge.call(n));
+    const started = Date.now();
+    const result = await input.bridge.call(n);
+    input.tally.maxCallMs = Math.max(input.tally.maxCallMs, Date.now() - started);
+    input.tally.record(input.bridge.label, n, result);
     await sleep(input.intervalMs);
   }
 };
@@ -605,6 +615,28 @@ export const scenarioIdleRestart = (opts: HarnessOptions) =>
     await runCalls({ bridge, tally, count: 4, intervalMs: 50 });
   });
 
+/** h. The supervisor stays registered but never restarts the daemon (launchd
+ * after a clean `daemon stop`): the bridge must start its own daemon after the
+ * grace period, and again when that one dies later. */
+export const scenarioSupervisorNeverRestarts = (opts: HarnessOptions) =>
+  withSandbox("h-supervisor-never-restarts", async (sandbox, tally, cleanup) => {
+    const supervisor = new Supervisor(sandbox, opts.restartDelayMs, false);
+    cleanup.push(() => supervisor.stop());
+    supervisor.start();
+    await supervisor.waitReady();
+    const bridge = new Bridge(sandbox, "h", opts.callTimeoutMs);
+    cleanup.push(() => bridge.dispose());
+    await bridge.initialize();
+    await runCalls({ bridge, tally, count: 2, intervalMs: 50 });
+    // A clean stop: the daemon exits and nothing restarts it.
+    supervisor.kill("SIGTERM");
+    if (supervisor.child) await waitForExit(supervisor.child, 10_000);
+    await runCalls({ bridge, tally, count: 2, intervalMs: 50 });
+    // A later drop: the bridge-started daemon dies too.
+    sandbox.killOwner();
+    await runCalls({ bridge, tally, count: 2, intervalMs: 50 });
+  });
+
 export const SCENARIOS = {
   a: scenarioDaemonRestart,
   b: scenarioSpawnerKilled,
@@ -613,6 +645,7 @@ export const SCENARIOS = {
   e: scenarioSupervisorTakeover,
   f: scenarioKillInFlight,
   g: scenarioIdleRestart,
+  h: scenarioSupervisorNeverRestarts,
 } as const;
 
 export const formatMetric = (r: Pick<ScenarioResult, "dropped" | "total">, name?: string) =>
@@ -637,7 +670,7 @@ if (import.meta.main) {
     dropped += result.dropped;
     total += result.total;
     console.log(
-      `${formatMetric(result, result.name)} bridge_spawns=${result.bridgeSpawns} outcomes=${JSON.stringify(result.outcomes)} secs=${Math.round((Date.now() - started) / 1000)}`,
+      `${formatMetric(result, result.name)} bridge_spawns=${result.bridgeSpawns} max_call_ms=${result.maxCallMs} outcomes=${JSON.stringify(result.outcomes)} secs=${Math.round((Date.now() - started) / 1000)}`,
     );
     for (const note of result.notes) console.log(`  ${note}`);
     if (process.env.BRIDGE_DEBUG) console.log(result.debug);
