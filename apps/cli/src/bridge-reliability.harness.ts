@@ -583,6 +583,28 @@ export const scenarioKillInFlight = (opts: HarnessOptions) =>
     }
   });
 
+/** g. The daemon restarts while the bridge is idle (nothing in flight), and
+ * the next call goes to the new daemon with the old session id. */
+export const scenarioIdleRestart = (opts: HarnessOptions) =>
+  withSandbox("g-idle-restart", async (sandbox, tally, cleanup) => {
+    const supervisor = new Supervisor(sandbox, opts.restartDelayMs);
+    cleanup.push(() => supervisor.stop());
+    supervisor.start();
+    await supervisor.waitReady();
+    const bridge = new Bridge(sandbox, "g", opts.callTimeoutMs);
+    cleanup.push(() => bridge.dispose());
+    await bridge.initialize();
+    for (let round = 0; round < 2; round++) {
+      await runCalls({ bridge, tally, count: 3, intervalMs: 50 });
+      const pid = supervisor.child?.pid ?? null;
+      supervisor.kill("SIGTERM");
+      while (supervisor.child?.pid === pid) await sleep(50);
+      await supervisor.waitReady();
+      await sleep(500);
+    }
+    await runCalls({ bridge, tally, count: 4, intervalMs: 50 });
+  });
+
 export const SCENARIOS = {
   a: scenarioDaemonRestart,
   b: scenarioSpawnerKilled,
@@ -590,6 +612,7 @@ export const SCENARIOS = {
   d: scenarioConcurrentRestart,
   e: scenarioSupervisorTakeover,
   f: scenarioKillInFlight,
+  g: scenarioIdleRestart,
 } as const;
 
 export const formatMetric = (r: Pick<ScenarioResult, "dropped" | "total">, name?: string) =>

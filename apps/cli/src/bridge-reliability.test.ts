@@ -4,6 +4,7 @@ import {
   defaultHarnessOptions,
   scenarioConcurrentRestart,
   scenarioDaemonRestart,
+  scenarioIdleRestart,
   scenarioKillInFlight,
   scenarioSpawnerKilled,
   scenarioSupervisorTakeover,
@@ -40,6 +41,10 @@ describe("executor mcp bridge under daemon faults", () => {
     const result = await scenarioKillInFlight(options);
     expectNoDrops(result);
     expect(result.outcomes.lost).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("recovers when the daemon restarted while the bridge was idle (stale session id)", async () => {
+    expectNoDrops(await scenarioIdleRestart(options));
   }, 120_000);
 
   it("follows a supervisor taking over from a bridge-spawned daemon", async () => {
