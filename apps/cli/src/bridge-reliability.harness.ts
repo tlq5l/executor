@@ -335,7 +335,9 @@ class Tally {
   record(label: string, n: number, result: { outcome: CallOutcome; detail?: string }) {
     this.outcomes[result.outcome] += 1;
     if (result.outcome !== "ok" && this.notes.length < 12) {
-      this.notes.push(`${label}#${n} ${result.outcome}${result.detail ? `: ${result.detail}` : ""}`);
+      this.notes.push(
+        `${label}#${n} ${result.outcome}${result.detail ? `: ${result.detail}` : ""}`,
+      );
     }
   }
 
@@ -368,7 +370,11 @@ const runCalls = async (input: {
 
 const withSandbox = async (
   name: string,
-  run: (sandbox: Sandbox, tally: Tally, cleanup: Array<() => Promise<void> | void>) => Promise<void>,
+  run: (
+    sandbox: Sandbox,
+    tally: Tally,
+    cleanup: Array<() => Promise<void> | void>,
+  ) => Promise<void>,
 ): Promise<ScenarioResult> => {
   const sandbox = new Sandbox(await freePort());
   const tally = new Tally();
@@ -513,9 +519,9 @@ export const formatMetric = (r: Pick<ScenarioResult, "dropped" | "total">, name?
 
 if (import.meta.main) {
   const opts = defaultHarnessOptions();
-  const picked = (process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(SCENARIOS)) as Array<
-    keyof typeof SCENARIOS
-  >;
+  const picked = (
+    process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(SCENARIOS)
+  ) as Array<keyof typeof SCENARIOS>;
   let dropped = 0;
   let total = 0;
   for (const key of picked) {
