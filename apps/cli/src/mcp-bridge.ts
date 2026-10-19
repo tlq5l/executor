@@ -111,8 +111,9 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   let internalCounter = 0;
   const replayWaiters = new Map<RequestId, (ok: boolean) => void>();
 
-  /** Client messages waiting for a connected daemon session. */
-  const queue: Array<{ message: JSONRPCMessage; queuedAt: number }> = [];
+  /** Client messages waiting for a connected daemon session. `forGeneration`
+   * pins a reply to the session whose prompt it answers. */
+  const queue: Array<{ message: JSONRPCMessage; queuedAt: number; forGeneration?: number }> = [];
   /** Client requests sent to the daemon and not yet answered. */
   const inFlight = new Map<RequestId, InFlight>();
   /** Daemon-to-client requests by the id the client saw: the session they
@@ -164,11 +165,18 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
     }
   };
 
-  const sendOnLink = (message: JSONRPCMessage, queuedAt: number) => {
+  /** `forGeneration`: the message is a reply to that session's prompt, so it
+   * is dropped once that session is gone (a new session would read it as the
+   * answer to its own prompt with the same daemon id). */
+  const sendOnLink = (message: JSONRPCMessage, queuedAt: number, forGeneration?: number) => {
+    if (forGeneration !== undefined && forGeneration !== generation) {
+      log("dropping a reply to a prompt from an earlier daemon session");
+      return;
+    }
     const current = link;
     const gen = generation;
     if (!current || state !== "connected") {
-      queue.push({ message, queuedAt });
+      queue.push({ message, queuedAt, forGeneration });
       return;
     }
     const entry: InFlight | null = isJSONRPCRequest(message)
@@ -199,7 +207,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
         // connection that broke mid-request may have run it. Only an HTTP
         // answer or a refused connect proves it never ran.
         if (entry && !neverReachedDaemon(cause)) settleLost(entry.message.id, entry);
-        else sendOnLink(message, queuedAt);
+        else sendOnLink(message, queuedAt, forGeneration);
       },
     );
   };
@@ -236,7 +244,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
         log(`dropping a reply to no current daemon request (id ${String(message.id)})`);
         return;
       }
-      sendOnLink({ ...message, id: origin.id }, Date.now());
+      sendOnLink({ ...message, id: origin.id }, Date.now(), origin.generation);
       return;
     }
     sendOnLink(message, Date.now());
@@ -308,7 +316,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   const flushQueue = () => {
     expireQueued();
     const pending = queue.splice(0, queue.length);
-    for (const entry of pending) sendOnLink(entry.message, entry.queuedAt);
+    for (const entry of pending) sendOnLink(entry.message, entry.queuedAt, entry.forGeneration);
   };
 
   let reconnecting: Promise<void> | null = null;
@@ -339,7 +347,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
         next.transport.onmessage = forwardFromDaemon(gen);
         next.transport.onerror = (error) => {
           if (gen !== generation || isClosed()) return;
-          log(`daemon transport error: ${error.message}`);
+          if (!isIdleStreamTimeout(error)) log(`daemon transport error: ${error.message}`);
           if (isSessionLostError(error)) dropLink(error.message);
           else probeSession();
         };
@@ -428,6 +436,14 @@ const isSessionLostError = (error: Error): boolean => {
   const text = error.message.toLowerCase();
   return text.includes("failed to reconnect") || text.includes("maximum reconnection attempts");
 };
+
+/** Bun's fetch (~300 s timeout) giving up on the standalone GET event stream
+ * of an idle session; the SDK reports it twice and does not reopen it. Calls
+ * are unaffected: each POST carries its own response stream, and the daemon
+ * sends prompts on the POST of the call they belong to (relatedRequestId).
+ * Not logged; calls in flight are still probed. */
+const isIdleStreamTimeout = (error: Error): boolean =>
+  error.name === "TimeoutError" || error.message === "The operation timed out.";
 
 const serverRequestId = (generation: number, id: RequestId) =>
   `${SERVER_REQUEST_ID_PREFIX}${generation}-${typeof id === "number" ? "n" : "s"}${id}`;

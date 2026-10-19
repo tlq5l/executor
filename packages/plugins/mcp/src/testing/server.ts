@@ -275,9 +275,15 @@ export const serveMcpServer = (factory: () => McpServer, options: McpTestServerO
 
       const nodeServer = http.createServer((request, response) => {
         inFlight += 1;
-        response.once("close", () => {
-          inFlight -= 1;
-        });
+        // Bun's node:http never emits the response's "close" when the client
+        // aborts mid-stream; it does emit the request's "aborted".
+        let open = true;
+        const settle = () => {
+          if (open) inFlight -= 1;
+          open = false;
+        };
+        response.once("close", settle);
+        request.once("aborted", settle);
         void Effect.runPromise(handleMcpRequest(request, response));
       });
 

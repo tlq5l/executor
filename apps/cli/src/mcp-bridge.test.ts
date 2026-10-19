@@ -66,18 +66,19 @@ const fakeDaemon = () => {
 const startBridge = (daemons: Array<FakeTransport>, maxBackoffMs = 20) => {
   const client = new FakeTransport();
   const abort = new AbortController();
+  const logs: Array<string> = [];
   let next = 0;
   const done = runMcpBridge({
     client,
     signal: abort.signal,
-    log: () => {},
+    log: (line) => logs.push(line),
     maxBackoffMs,
     connect: async () => {
       const transport = daemons[Math.min(next++, daemons.length - 1)];
       return transport ? { transport, label: `daemon-${next}` } : null;
     },
   });
-  return { client, stop: () => abort.abort(), done, connects: () => next };
+  return { client, logs, stop: () => abort.abort(), done, connects: () => next };
 };
 
 const clientReplies = (client: FakeTransport) =>
@@ -243,6 +244,72 @@ describe("runMcpBridge", () => {
     client.deliver({ jsonrpc: "2.0", id: newPrompt!.id, result: { action: "decline" } });
     await tick();
     expect(repliesToNew()).toEqual([{ jsonrpc: "2.0", id: 0, result: { action: "decline" } }]);
+    stop();
+    await done;
+  });
+
+  it("drops a reply whose POST failed with the session instead of sending it to the next one", async () => {
+    const first = fakeDaemon();
+    const second = fakeDaemon();
+    const { client, stop, done } = startBridge([first, second]);
+    await tick();
+    client.deliver(INITIALIZE);
+    client.deliver({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await tick();
+
+    first.deliver(request(0, "elicitation/create", { message: "approve OLD action" }));
+    await tick();
+    const [prompt] = client.sent.filter(
+      (m) => "method" in m && m.method === "elicitation/create",
+    ) as Array<JSONRPCMessage & { id: string }>;
+
+    // The daemon restarted before the user answered: the reply's POST gets a
+    // 404 for the gone session. The new session must never see that reply
+    // (its own prompt 0 would take it as an answer).
+    first.onSend = async () => {
+      throw new StreamableHTTPError(404, "Error POSTing to endpoint: session not found");
+    };
+    client.deliver({ jsonrpc: "2.0", id: prompt!.id, result: { action: "accept" } });
+    await tick(100);
+    expect(second.sent.filter((m) => !("method" in m))).toEqual([]);
+    stop();
+    await done;
+  });
+
+  it("does not log the event stream's benign idle timeout, but still checks calls in flight", async () => {
+    const daemon = fakeDaemon();
+    const { client, logs, stop, done } = startBridge([daemon]);
+    await tick();
+    client.deliver(INITIALIZE);
+    client.deliver({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await tick();
+
+    // Bun's fetch gives up on the idle GET event stream after ~5 minutes.
+    const idleTimeout = () => {
+      const error = new Error("The operation timed out.");
+      error.name = "TimeoutError";
+      return error;
+    };
+    daemon.onerror?.(idleTimeout());
+    await tick();
+    expect(logs.filter((line) => line.includes("transport error"))).toEqual([]);
+
+    // With a call in flight the session is still probed.
+    daemon.onSend = async (message) => {
+      if ("method" in message && message.method === "ping" && "id" in message) {
+        queueMicrotask(() =>
+          daemon.deliver({ jsonrpc: "2.0", id: message.id, result: {} } as JSONRPCMessage),
+        );
+      }
+    };
+    client.deliver(request(2, "tools/call", { name: "execute", arguments: { code: "1" } }));
+    await tick();
+    daemon.onerror?.(idleTimeout());
+    await tick();
+    expect(daemon.sent.some((m) => "method" in m && m.method === "ping")).toBe(true);
+    // Other transport errors are still logged.
+    daemon.onerror?.(new Error("SSE stream disconnected: boom"));
+    expect(logs.some((line) => line.includes("boom"))).toBe(true);
     stop();
     await done;
   });

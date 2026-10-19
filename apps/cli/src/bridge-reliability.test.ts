@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 
 import {
   defaultHarnessOptions,
+  scenarioCliDuringRestart,
   scenarioConcurrentRestart,
   scenarioDaemonRestart,
   scenarioIdleRestart,
@@ -59,4 +60,10 @@ describe("executor mcp bridge under daemon faults", () => {
     expectNoDrops(result);
     expect(result.bridgeSpawns).toBe(2);
   }, 180_000);
+
+  it("makes a one-shot CLI command wait for the supervisor instead of starting its own daemon", async () => {
+    const result = await scenarioCliDuringRestart(options);
+    expectNoDrops(result);
+    expect(result.bridgeSpawns).toBe(0);
+  }, 120_000);
 });

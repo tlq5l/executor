@@ -7,7 +7,7 @@
  * call the bridge reports as lost (the daemon died while running it, so its
  * outcome is unknown) is the designed answer, not a drop; it is counted apart.
  *
- *   bun run apps/cli/src/bridge-reliability.harness.ts [a b c d e f g h]
+ *   bun run apps/cli/src/bridge-reliability.harness.ts [a b c d e f g h i]
  *
  * Env: BRIDGE_IDLE_MS (scenario c idle gap, default 5000), BRIDGE_RESTART_DELAY_MS
  * (supervisor restart delay, default 1000), BRIDGE_CALLS (calls per bridge,
@@ -637,6 +637,54 @@ export const scenarioSupervisorNeverRestarts = (opts: HarnessOptions) =>
     await runCalls({ bridge, tally, count: 2, intervalMs: 50 });
   });
 
+/** i. A one-shot CLI command (not a bridge) runs while the supervised daemon
+ * is restarting: it must wait for the supervisor's daemon, not start its own
+ * (which the supervised one would then fail to replace). */
+export const scenarioCliDuringRestart = (opts: HarnessOptions) =>
+  withSandbox("i-cli-during-restart", async (sandbox, tally, cleanup) => {
+    // Slower than a CLI start, so a command that does not wait spawns first.
+    const supervisor = new Supervisor(sandbox, Math.max(opts.restartDelayMs, 4_000));
+    cleanup.push(() => supervisor.stop());
+    supervisor.start();
+    await supervisor.waitReady();
+    const pid = supervisor.child?.pid ?? null;
+    supervisor.kill("SIGTERM");
+    if (supervisor.child) await waitForExit(supervisor.child, 10_000);
+    const started = Date.now();
+    const result = await runCli(sandbox, ["tools", "search", "x"], opts.callTimeoutMs);
+    tally.maxCallMs = Math.max(tally.maxCallMs, Date.now() - started);
+    tally.record("i-cli", 0, result);
+    while (supervisor.child?.pid === pid) await sleep(50);
+    const owner = await sandbox.waitForOwner(supervisor.child?.pid ?? null, 10_000);
+    if (owner === null) tally.notes.push("the supervised daemon never became owner again");
+  });
+
+/** Run one CLI command in the sandbox; its stderr counts toward spawns. */
+const runCli = (
+  sandbox: Sandbox,
+  args: ReadonlyArray<string>,
+  timeoutMs: number,
+): Promise<{ outcome: CallOutcome; detail?: string }> =>
+  new Promise((resolveRun) => {
+    const child = track(
+      spawn(process.execPath, ["run", CLI_MAIN, ...args], {
+        env: sandbox.env(),
+        stdio: ["ignore", "ignore", "pipe"],
+      }),
+    );
+    let stderr = "";
+    child.stderr!.on("data", (chunk) => (stderr += String(chunk)));
+    sandbox.bridgeLogs.push(() => stderr);
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolveRun({ outcome: "timeout" });
+    }, timeoutMs);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolveRun(code === 0 ? { outcome: "ok" } : { outcome: "error", detail: stderr.slice(-400) });
+    });
+  });
+
 export const SCENARIOS = {
   a: scenarioDaemonRestart,
   b: scenarioSpawnerKilled,
@@ -646,6 +694,7 @@ export const SCENARIOS = {
   f: scenarioKillInFlight,
   g: scenarioIdleRestart,
   h: scenarioSupervisorNeverRestarts,
+  i: scenarioCliDuringRestart,
 } as const;
 
 export const formatMetric = (r: Pick<ScenarioResult, "dropped" | "total">, name?: string) =>

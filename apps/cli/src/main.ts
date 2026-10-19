@@ -83,6 +83,7 @@ import {
   daemonSupervisorStatus,
   describeDaemonSupervisor,
   readDaemonSupervisorMarker,
+  type DaemonSupervisor,
   writeDaemonSupervisorMarker,
 } from "./daemon-supervisor";
 
@@ -921,6 +922,7 @@ const resolveExecutorServerConnection = (
       );
     }
 
+    yield* awaitSupervisedDaemon();
     const daemonUrl = yield* ensureDaemon(requested.origin);
     // The daemon we just ensured published a manifest carrying its bearer token
     // (minted into auth.json). Prefer that authed connection — otherwise the
@@ -1009,6 +1011,14 @@ const stopDaemon = (
     yield* removeDaemonPointer({ hostname: host, scopeId }).pipe(Effect.ignore);
     yield* removeLocalServerManifestIfOwnedBy({ pid: record.pid }).pipe(Effect.ignore);
     console.log(`Daemon stopped at ${target.baseUrl}.`);
+    const supervisor = yield* readDaemonSupervisorMarker();
+    if (supervisor?.kind === "launchd") {
+      // A clean exit: KeepAlive (SuccessfulExit=false) leaves it down, so the
+      // next command or MCP session starts a daemon of its own right away.
+      console.log(
+        `launchd will not restart it (the job stays loaded). To run it under launchd again: launchctl kickstart gui/${process.getuid?.() ?? 0}/${supervisor.label}`,
+      );
+    }
   }).pipe(Effect.mapError(toError));
 
 type ExecuteCodeOutcome =
@@ -1511,11 +1521,12 @@ const runMcpHttpBridge = async (input: {
   }
 };
 
-/** How long a bridge waits for the supervisor to bring the daemon back before
- * it starts one itself. A registered supervisor may still never restart it:
- * launchd's KeepAlive (SuccessfulExit=false) leaves a daemon that exited
- * cleanly, e.g. after `executor daemon stop`, down while the job stays loaded.
- * launchd's own restart throttle is 10 s, well inside this. */
+/** How long a bridge or CLI command waits for the supervisor to bring the
+ * daemon back before it starts one itself. For launchd the job state says
+ * whether it will (daemon-supervisor.ts), so this bounds only the cases that
+ * can't be told apart: a pid supervisor that stays up but never restarts it,
+ * or one that can't be checked. launchd's own restart throttle is 10 s, well
+ * inside this. */
 const SUPERVISOR_GRACE_MS = 30_000;
 /** When the current wait for the supervisor began; null while the daemon is
  * reachable, so every later outage gets its own grace period. */
@@ -1540,11 +1551,38 @@ const waitForDaemonSupervisor = (): Effect.Effect<
     const now = Date.now();
     if (supervisorWaitStartedAt === null) {
       supervisorWaitStartedAt = now;
-      console.error(
-        `Executor MCP bridge: the daemon is down; waiting up to ${SUPERVISOR_GRACE_MS / 1000}s for the ${describeDaemonSupervisor(supervisor)} to restart it.`,
-      );
+      console.error(`Executor MCP bridge: ${supervisorWaitMessage(supervisor)}`);
     }
     return now - supervisorWaitStartedAt <= SUPERVISOR_GRACE_MS;
+  });
+
+const supervisorWaitMessage = (supervisor: DaemonSupervisor) =>
+  `the daemon is down; waiting up to ${SUPERVISOR_GRACE_MS / 1000}s for the ${describeDaemonSupervisor(supervisor)} to restart it.`;
+
+/** For one-shot CLI commands: before ensureDaemon starts a daemon, give an OS
+ * supervisor that will restart the one that is down the same grace period the
+ * bridge does, so a command run during a restart does not start a competing
+ * daemon. Returns as soon as an owner is reachable or the supervisor is gone. */
+const awaitSupervisedDaemon = (): Effect.Effect<
+  void,
+  never,
+  FileSystem.FileSystem | PlatformPath.Path
+> =>
+  Effect.gen(function* () {
+    if (yield* readActiveLocalServerManifest()) return;
+    const supervisor = yield* readDaemonSupervisorMarker();
+    if (!supervisor) return;
+    const deadline = Date.now() + SUPERVISOR_GRACE_MS;
+    let announced = false;
+    while (Date.now() < deadline) {
+      if ((yield* Effect.promise(() => daemonSupervisorStatus(supervisor))) === "gone") return;
+      if (!announced) {
+        announced = true;
+        console.error(`Executor: ${supervisorWaitMessage(supervisor)}`);
+      }
+      yield* Effect.sleep("250 millis");
+      if (yield* readActiveLocalServerManifest()) return;
+    }
   });
 
 /** The reachable local owner, starting a daemon on demand when there is none.
@@ -2933,6 +2971,7 @@ const daemonRestartCommand = Command.make(
     Effect.gen(function* () {
       applyScope(scope);
       yield* stopDaemon(baseUrl);
+      yield* awaitSupervisedDaemon();
       const daemonUrl = yield* ensureDaemon(baseUrl);
       console.log(`Daemon restarted at ${daemonUrl}.`);
     }),

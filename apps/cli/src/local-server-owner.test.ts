@@ -349,7 +349,10 @@ describe("executor mcp with a stalled owner", () => {
         // this (live) test process instead of starting anything; the stall
         // messages asserted below still tell the fixed path from the old one.
         await holdDaemonStartLock(dataDir);
-        const unfreeze = freezeFor(owner.child, 6_000);
+        // Frozen until the CLI has seen the stall, then a while longer: a fixed
+        // freeze could thaw before a slow CLI start (>6 s under full-suite
+        // load) even probed the owner, and nothing stalled would be tested.
+        owner.child.kill("SIGSTOP");
 
         let stderr = "";
         cli = spawn(process.execPath, ["run", CLI_MAIN, "mcp"], {
@@ -359,6 +362,15 @@ describe("executor mcp with a stalled owner", () => {
         cli.stderr!.on("data", (chunk) => (stderr += String(chunk)));
         cli.stdin!.write(MCP_INITIALIZE);
 
+        await waitFor(
+          () => stderr.includes("is running but not answering"),
+          45_000,
+          `the CLI to report the stalled owner (stderr so far:\n${stderr})`,
+        );
+        // Past the CLI's 2 s probe timeout, so it must keep waiting, not give up.
+        await new Promise((r) => setTimeout(r, 3_000));
+        owner.child.kill("SIGCONT");
+
         // The bridge reaching the owner's /mcp endpoint is the client connecting.
         await waitFor(
           () =>
@@ -367,7 +379,6 @@ describe("executor mcp with a stalled owner", () => {
           45_000,
           `the CLI to reach the owner's /mcp (stderr so far:\n${stderr})`,
         );
-        unfreeze();
 
         expect(stderr).toContain(`Executor server pid ${owner.pid}`);
         expect(stderr).toContain("answered again");

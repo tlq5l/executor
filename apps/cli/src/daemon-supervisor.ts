@@ -90,13 +90,33 @@ export const readDaemonSupervisorMarker = (): Effect.Effect<
     }
   });
 
-const launchdJobLoaded = (label: string): Promise<boolean> =>
+/** `launchctl print gui/<uid>/<label>` output, or null when the job is not
+ * loaded (launchctl exits non-zero). */
+const launchdPrint = (label: string): Promise<string | null> =>
   new Promise((resolve) => {
     const uid = process.getuid?.() ?? 0;
-    execFile("launchctl", ["print", `gui/${uid}/${label}`], { timeout: 5_000 }, (error) =>
-      resolve(!error),
+    execFile("launchctl", ["print", `gui/${uid}/${label}`], { timeout: 5_000 }, (error, stdout) =>
+      resolve(error ? null : String(stdout)),
     );
   });
+
+/** Will launchd (re)start this loaded job on its own, judging by its
+ * `launchctl print` dump? A job that is running, starting or throttled
+ * ("spawn scheduled") will be; so is one that crashed or was killed while a
+ * KeepAlive rule applies. One that exited cleanly is not: under KeepAlive
+ * SuccessfulExit=false (our LaunchAgent), e.g. after `executor daemon stop`,
+ * launchd leaves it down while the job stays loaded. */
+export const launchdWillRestart = (printOutput: string): boolean => {
+  const field = (name: string) =>
+    new RegExp(`^\\t${name} = (.*)$`, "m").exec(printOutput)?.[1]?.trim() ?? null;
+  if (field("state") !== "not running") return true;
+  if (/\bkeepalive\b/.test(field("properties") ?? "")) return true;
+  const exitCode = field("last exit code");
+  const crashed =
+    field("last terminating signal") !== null ||
+    (exitCode !== null && exitCode !== "0" && !exitCode.startsWith("(never"));
+  return crashed && /successful exit => 0/.test(printOutput);
+};
 
 const pidAlive = (pid: number): boolean => {
   try {
@@ -108,22 +128,24 @@ const pidAlive = (pid: number): boolean => {
 };
 
 /**
- * Is the recorded supervisor still there to restart the daemon?
+ * Is the recorded supervisor still there, and going to restart the daemon?
  * "unknown" when it can't be checked (callers wait a bounded grace period).
  */
 export const daemonSupervisorStatus = async (
   supervisor: DaemonSupervisor,
   deps: {
-    readonly launchdJobLoaded?: (label: string) => Promise<boolean>;
+    /** `launchctl print` output for the job, null when it is not loaded. */
+    readonly launchdPrint?: (label: string) => Promise<string | null>;
     readonly pidAlive?: (pid: number) => boolean;
   } = {},
 ): Promise<"registered" | "gone" | "unknown"> => {
   switch (supervisor.kind) {
-    case "launchd":
-      if (process.platform !== "darwin" && !deps.launchdJobLoaded) return "unknown";
-      return (await (deps.launchdJobLoaded ?? launchdJobLoaded)(supervisor.label))
-        ? "registered"
-        : "gone";
+    case "launchd": {
+      if (process.platform !== "darwin" && !deps.launchdPrint) return "unknown";
+      // "gone" also covers a loaded job launchd will not restart.
+      const printed = await (deps.launchdPrint ?? launchdPrint)(supervisor.label);
+      return printed !== null && launchdWillRestart(printed) ? "registered" : "gone";
+    }
     case "pid":
       return (deps.pidAlive ?? pidAlive)(supervisor.pid) ? "registered" : "gone";
     case "other":
