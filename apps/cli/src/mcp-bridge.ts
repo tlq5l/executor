@@ -132,8 +132,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   const settleLost = (id: RequestId, entry: InFlight) => {
     inFlight.delete(id);
     if (READ_ONLY_METHODS.has(entry.message.method)) {
-      queue.push({ message: entry.message, queuedAt: entry.queuedAt });
-      if (state === "connected") flushQueue();
+      sendOnLink(entry.message, entry.queuedAt);
     } else {
       answerWithError(
         id,
@@ -164,8 +163,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
         // The POST failed, so the daemon never handled it: always safe to resend.
         if (entry) inFlight.delete(entry.message.id);
         if (gen !== generation) {
-          queue.push({ message, queuedAt });
-          if (state === "connected") flushQueue();
+          sendOnLink(message, queuedAt);
           return;
         }
         log(`send to daemon failed: ${errorMessage(cause)}`);
@@ -263,6 +261,11 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   };
 
   let reconnecting: Promise<void> | null = null;
+  const reconnect = () => {
+    reconnecting ??= establish().finally(() => {
+      reconnecting = null;
+    });
+  };
 
   const establish = async (): Promise<void> => {
     let attempt = 0;
@@ -320,9 +323,7 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
     for (const [id, entry] of inFlight) {
       if (entry.accepted) settleLost(id, entry);
     }
-    reconnecting ??= establish().finally(() => {
-      reconnecting = null;
-    });
+    reconnect();
   }
 
   const shutdown = () => {
@@ -340,18 +341,15 @@ export const runMcpBridge = async (options: McpBridgeOptions): Promise<void> => 
   client.onclose = shutdown;
   client.onerror = (error) => log(`stdio transport error: ${error.message}`);
 
+  if (options.signal?.aborted) return;
   const expiry = setInterval(expireQueuedRequests, 1_000);
   expiry.unref?.();
-
-  if (options.signal?.aborted) return;
   options.signal?.addEventListener("abort", shutdown, { once: true });
 
   // Start reading the client right away: anything it sends before the first
   // daemon session is up waits in the queue.
   await client.start();
-  reconnecting = establish().finally(() => {
-    reconnecting = null;
-  });
+  reconnect();
   try {
     await exited;
   } finally {

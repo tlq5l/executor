@@ -313,7 +313,7 @@ class Bridge {
       : this.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
   }
 
-  async kill(signal: NodeJS.Signals) {
+  kill(signal: NodeJS.Signals) {
     if (!exited(this.child)) this.child.kill(signal);
   }
 
@@ -439,9 +439,9 @@ export const scenarioSpawnerKilled = (opts: HarnessOptions) =>
       intervalMs: 150,
       onCall: async (n) => {
         if (n === half) {
-          await spawner.kill("SIGINT");
+          spawner.kill("SIGINT");
           await sleep(300);
-          await spawner.kill("SIGTERM");
+          spawner.kill("SIGTERM");
         }
       },
     });
