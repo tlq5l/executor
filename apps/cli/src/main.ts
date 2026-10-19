@@ -77,7 +77,7 @@ import * as Option from "effect/Option";
 import * as Cause from "effect/Cause";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { runMcpBridge } from "./mcp-bridge";
 
 import { ExecutorApi, checkForUpdate } from "@executor-js/api";
 import {
@@ -1446,98 +1446,83 @@ const mcpUrlForActiveLocalServer = (input: {
  * and the daemon over Streamable HTTP. That keeps any number of MCP clients (plus
  * the web UI and the desktop app) attached to the single owning daemon at once,
  * and means a transient MCP client exiting never takes the server down. Resolves
- * when stdin closes or the daemon connection drops; close is best-effort.
+ * when stdin closes or the process is signalled; a dropped daemon session is
+ * reconnected (see mcp-bridge.ts), never a reason to exit.
  */
 const runMcpHttpBridge = async (input: {
-  readonly manifest: ExecutorLocalServerManifest;
+  readonly resolveOwner: () => Promise<ExecutorLocalServerManifest | null>;
   readonly elicitationMode: "browser" | "model";
   readonly artifacts: boolean;
   readonly searchTools: boolean;
   readonly toolMode: "codemode" | "passthrough";
 }): Promise<void> => {
-  const stdio = new StdioServerTransport();
-  const authorization = getExecutorServerAuthorizationHeader(input.manifest.connection);
-  const http = new StreamableHTTPClientTransport(
-    mcpUrlForActiveLocalServer({
-      connection: input.manifest.connection,
-      elicitationMode: input.elicitationMode,
-      artifacts: input.artifacts,
-      searchTools: input.searchTools,
-      toolMode: input.toolMode,
-    }),
-    authorization ? { requestInit: { headers: { Authorization: authorization } } } : undefined,
-  );
-
-  let finished = false;
-  let closing = false;
-  let closePromise: Promise<void> | null = null;
-  let resolveExit: () => void = () => {};
-  const waitForExit = new Promise<void>((resolve) => {
-    resolveExit = resolve;
-  });
-
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
-    process.stdin.off("end", shutdown);
-    process.stdin.off("close", shutdown);
-    resolveExit();
-  };
-
-  const closeBoth = (): Promise<void> => {
-    if (!closePromise) {
-      closing = true;
-      closePromise = Promise.allSettled([stdio.close(), http.close()]).then(() => undefined);
-    }
-    return closePromise;
-  };
-
-  function shutdown() {
-    finish();
-    void closeBoth();
-  }
-
-  const isAbortDuringClose = (error: Error): boolean =>
-    error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
-
-  const reportError = (context: string, cause: unknown) => {
-    const error = toError(cause);
-    if (closing && isAbortDuringClose(error)) return;
-    console.error(`Executor MCP bridge ${context}: ${error.message}`);
-  };
-
-  const forwardMessage =
-    (send: (message: JSONRPCMessage) => Promise<void>, context: string) =>
-    (message: JSONRPCMessage) => {
-      void send(message).then(undefined, (cause: unknown) => {
-        reportError(context, cause);
-        shutdown();
-      });
-    };
-
+  const stop = new AbortController();
+  const shutdown = () => stop.abort();
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
   process.stdin.once("end", shutdown);
   process.stdin.once("close", shutdown);
 
-  stdio.onclose = shutdown;
-  http.onclose = shutdown;
-  stdio.onerror = (error) => reportError("stdio transport error", error);
-  http.onerror = (error) => reportError("daemon transport error", error);
-  stdio.onmessage = forwardMessage((message) => http.send(message), "failed to send to daemon");
-  http.onmessage = forwardMessage((message) => stdio.send(message), "failed to send to stdio");
-
   try {
-    await http.start();
-    await stdio.start();
-    await waitForExit;
+    await runMcpBridge({
+      client: new StdioServerTransport(),
+      signal: stop.signal,
+      log: (line) => console.error(`Executor MCP bridge: ${line}`),
+      connect: async () => {
+        const manifest = await input.resolveOwner();
+        if (!manifest) return null;
+        const authorization = getExecutorServerAuthorizationHeader(manifest.connection);
+        return {
+          label: manifest.connection.origin,
+          transport: new StreamableHTTPClientTransport(
+            mcpUrlForActiveLocalServer({
+              connection: manifest.connection,
+              elicitationMode: input.elicitationMode,
+              artifacts: input.artifacts,
+              searchTools: input.searchTools,
+              toolMode: input.toolMode,
+            }),
+            authorization
+              ? { requestInit: { headers: { Authorization: authorization } } }
+              : undefined,
+          ),
+        };
+      },
+    });
   } finally {
-    finish();
-    await closeBoth();
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+    process.stdin.off("end", shutdown);
+    process.stdin.off("close", shutdown);
   }
 };
+
+/** The reachable local owner, starting a daemon on demand when there is none.
+ * Null when no owner could be found or started this time (the bridge retries). */
+const resolveBridgeOwner = (): Effect.Effect<
+  ExecutorLocalServerManifest | null,
+  never,
+  FileSystem.FileSystem | PlatformPath.Path
+> =>
+  Effect.gen(function* () {
+    const active = yield* readActiveLocalServerManifest();
+    if (active) return active;
+    // No reachable owner yet: ensure one. If we lose the election (another
+    // process became owner first), ensureDaemon may fail, but the winner's
+    // manifest is then reachable, so re-read it and bridge to that instead.
+    return yield* ensureDaemon(DEFAULT_BASE_URL).pipe(
+      Effect.flatMap(() => readLocalServerOwner()),
+      Effect.catch((error) =>
+        readLocalServerOwner().pipe(
+          Effect.tap((manifest) =>
+            manifest
+              ? Effect.void
+              : Effect.sync(() => console.error(`Executor MCP bridge: ${error.message}`)),
+          ),
+        ),
+      ),
+    );
+  });
 
 const runStdioMcpSession = (input: {
   readonly elicitationMode: "browser" | "model";
@@ -1546,46 +1531,15 @@ const runStdioMcpSession = (input: {
   readonly toolMode: "codemode" | "passthrough";
 }) =>
   Effect.gen(function* () {
-    // `executor mcp` never owns the local database. If a local server is already
-    // running, bridge this stdio client to it; otherwise ensure a durable
-    // background daemon is up and bridge to that. ensureDaemon is the race-safe
-    // election: concurrent cold starts elect one owner and the losers wait for
-    // its manifest (waitForDaemonStartupTarget) rather than failing. Bridging
-    // means many MCP clients, the web UI, and the desktop app share one owner,
-    // and that owner's lifetime is never tied to a transient MCP client.
-    const active = yield* readActiveLocalServerManifest();
-    if (active) {
-      yield* Effect.promise(() =>
-        runMcpHttpBridge({
-          manifest: active,
-          elicitationMode: input.elicitationMode,
-          artifacts: input.artifacts,
-          searchTools: input.searchTools,
-          toolMode: input.toolMode,
-        }),
-      );
-      return;
-    }
-
-    // No reachable owner yet: ensure one. If we lose the election (another
-    // process became owner first), ensureDaemon may fail, but the winner's
-    // manifest is then reachable, so re-read it and bridge to that instead.
-    const elected = yield* ensureDaemon(DEFAULT_BASE_URL).pipe(
-      Effect.flatMap(() => readLocalServerOwner()),
-      Effect.catch((error) =>
-        readLocalServerOwner().pipe(
-          Effect.flatMap((manifest) => (manifest ? Effect.succeed(manifest) : Effect.fail(error))),
-        ),
-      ),
-    );
-    if (!elected) {
-      return yield* Effect.fail(
-        new Error("The local Executor daemon started but did not advertise a reachable manifest."),
-      );
-    }
+    // `executor mcp` never owns the local database. It bridges this stdio
+    // client to the local owner (starting a durable background daemon when
+    // there is none; ensureDaemon is the race-safe election), and re-resolves
+    // the owner whenever the daemon session breaks, so a daemon restart or
+    // takeover never ends the client's MCP session.
+    const services = yield* Effect.context<FileSystem.FileSystem | PlatformPath.Path>();
     yield* Effect.promise(() =>
       runMcpHttpBridge({
-        manifest: elected,
+        resolveOwner: () => Effect.runPromiseWith(services)(resolveBridgeOwner()),
         elicitationMode: input.elicitationMode,
         artifacts: input.artifacts,
         searchTools: input.searchTools,
